@@ -14,6 +14,7 @@ use crate::dataset::{self, AnnotatedImage, FaceBox};
 pub struct DatasetState {
     entries: Vec<AnnotatedImage>,
     images_root: PathBuf,
+    inference: std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, crate::model::Model)>>,
 }
 
 impl DatasetState {
@@ -25,6 +26,7 @@ impl DatasetState {
         Ok(Self {
             entries,
             images_root,
+            inference: std::sync::Mutex::new(None),
         })
     }
 }
@@ -33,6 +35,8 @@ pub fn router(state: DatasetState) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("viewer.html")) }))
         .route("/api/train", get(list_images))
+        .route("/api/weights", get(list_weights))
+        .route("/api/train/{id}/predicted", get(get_predicted_image))
         .route("/api/train/{id}/annotated", get(get_annotated_image))
         .route("/api/train/{id}/image", get(get_image))
         .with_state(Arc::new(state))
@@ -294,4 +298,160 @@ mod tests {
             );
         }
     }
+}
+
+fn weights_root() -> PathBuf {
+    std::env::var_os("WEIGHTS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("runs"))
+}
+
+async fn list_weights() -> Result<Json<Vec<String>>, ApiError> {
+    let paths = tokio::task::spawn_blocking(|| {
+        fn visit(root: &FsPath, dir: &FsPath, result: &mut Vec<String>) -> io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    visit(root, &entry.path(), result)?;
+                } else if entry.path().extension().is_some_and(|e| e == "bpk") {
+                    result.push(
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+            Ok(())
+        }
+        let root = weights_root();
+        let mut paths = Vec::new();
+        if root.exists() {
+            visit(&root, &root, &mut paths)?;
+        }
+        paths.sort();
+        Ok::<_, io::Error>(paths)
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Lecture des poids impossible",
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Lecture des poids impossible",
+        )
+    })?;
+    Ok(Json(paths))
+}
+
+#[derive(Deserialize)]
+struct PredictionQuery {
+    weights: String,
+    #[serde(default = "default_threshold")]
+    threshold: f32,
+    #[serde(default = "default_annotations")]
+    annotations: bool,
+}
+fn default_threshold() -> f32 {
+    0.5
+}
+fn default_annotations() -> bool {
+    true
+}
+
+async fn get_predicted_image(
+    State(state): State<Arc<DatasetState>>,
+    Path(id): Path<usize>,
+    query: Result<Query<PredictionQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Paramètres invalides"))?;
+    if !query.threshold.is_finite() || !(0.0..=1.0).contains(&query.threshold) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Seuil attendu entre 0 et 1",
+        ));
+    }
+    let relative = FsPath::new(&query.weights);
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || relative.extension().is_none_or(|e| e != "bpk")
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Fichier de poids invalide",
+        ));
+    }
+    let root = tokio::fs::canonicalize(weights_root())
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Dossier de poids absent"))?;
+    let path = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Poids introuvables"))?;
+    if !path.starts_with(&root) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Fichier de poids invalide",
+        ));
+    }
+    let bytes = read_image(&state, id).await?;
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_err(|e| e.to_string())?;
+        // Sérialiser l'accès GPU et réutiliser le modèle tant que le fichier est inchangé.
+        let mut cache = state
+            .inference
+            .lock()
+            .map_err(|_| "Modèle indisponible : redémarrez le serveur".to_string())?;
+        if cache
+            .as_ref()
+            .is_none_or(|(p, m, _)| p != &path || *m != modified)
+        {
+            let model = crate::infer::load(&path)?;
+            *cache = Some((path, modified, model));
+        }
+        let detections =
+            crate::infer::predict(&cache.as_ref().unwrap().2, &bytes, query.threshold)?;
+        let faces = if query.annotations {
+            state.entries[id].faces.as_slice()
+        } else {
+            &[]
+        };
+        crate::infer::overlay(&bytes, faces, &detections)
+    })
+    .await
+    .map_err(|e| {
+        eprintln!("Inférence : {e}");
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Échec de l'inférence ; consultez le terminal",
+        )
+    })?;
+    let png = result.map_err(|e| {
+        eprintln!("Inférence : {e}");
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Poids incompatibles ou inférence impossible ; consultez le terminal",
+        )
+    })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        png,
+    )
+        .into_response())
 }

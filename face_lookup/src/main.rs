@@ -2,6 +2,7 @@ mod api;
 mod batch;
 mod dataset;
 mod device;
+mod infer;
 mod loss;
 mod model;
 mod render;
@@ -67,7 +68,7 @@ fn train_dataset(
 
     // Petit ensemble pour commencer.
     let samples = dataset::load_annotations(annotations_path)?
-        .take(16)
+        //.take(16)
         .collect::<Result<Vec<_>, _>>()?;
 
     if samples.is_empty() {

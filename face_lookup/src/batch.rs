@@ -6,6 +6,26 @@ pub const IMAGE_SIZE: usize = 320;
 pub const GRID_SIZE: usize = 40;
 const CELLS: usize = GRID_SIZE * GRID_SIZE;
 
+/// Prétraitement partagé par l'entraînement et l'inférence.
+pub fn prepare_image(original: &image::RgbImage) -> (Vec<f32>, u32, u32, usize, usize) {
+    let (ow, oh) = original.dimensions();
+    let plane = IMAGE_SIZE * IMAGE_SIZE;
+    let mut pixels = vec![0.0f32; 3 * plane];
+    let scale = (IMAGE_SIZE as f32 / ow as f32).min(IMAGE_SIZE as f32 / oh as f32);
+    let width = ((ow as f32 * scale).round() as u32).clamp(1, IMAGE_SIZE as u32);
+    let height = ((oh as f32 * scale).round() as u32).clamp(1, IMAGE_SIZE as u32);
+    let left = (IMAGE_SIZE - width as usize) / 2;
+    let top = (IMAGE_SIZE - height as usize) / 2;
+    let resized = image::imageops::resize(original, width, height, FilterType::Triangle);
+    for (x, y, pixel) in resized.enumerate_pixels() {
+        for channel in 0..3 {
+            pixels[channel * plane + (top + y as usize) * IMAGE_SIZE + left + x as usize] =
+                pixel[channel] as f32 / 255.0;
+        }
+    }
+    (pixels, width, height, left, top)
+}
+
 pub struct DetectionBatch {
     pub images: Tensor<4>,        // [N, 3, 320, 320], RGB en plans séparés
     pub presence: Tensor<4>,      // [N, 1, 40, 40]
@@ -46,20 +66,8 @@ pub fn make_batch(
         if ow == 0 || oh == 0 {
             return Err("Image vide".into());
         }
-        let scale = (IMAGE_SIZE as f32 / ow as f32).min(IMAGE_SIZE as f32 / oh as f32);
-        let width = ((ow as f32 * scale).round() as u32).clamp(1, IMAGE_SIZE as u32);
-        let height = ((oh as f32 * scale).round() as u32).clamp(1, IMAGE_SIZE as u32);
-        let left = (IMAGE_SIZE - width as usize) / 2;
-        let top = (IMAGE_SIZE - height as usize) / 2;
-        let resized = image::imageops::resize(&original, width, height, FilterType::Triangle);
-        for (x, y, pixel) in resized.enumerate_pixels() {
-            for channel in 0..3 {
-                pixels[(i * 3 + channel) * plane
-                    + (top + y as usize) * IMAGE_SIZE
-                    + left
-                    + x as usize] = pixel[channel] as f32 / 255.0;
-            }
-        }
+        let (image_pixels, width, height, left, top) = prepare_image(&original);
+        pixels[i * 3 * plane..(i + 1) * 3 * plane].copy_from_slice(&image_pixels);
         // Utiliser les dimensions réellement arrondies, comme pour les pixels.
         let sx = width as f32 / ow as f32;
         let sy = height as f32 / oh as f32;
@@ -192,6 +200,11 @@ mod tests {
         let path = dir.path().join("model.bpk");
         model.into_record().save(&path)?;
         let restored = Model::default(&device).load_record(ModuleRecord::load(&path)?);
+        let inference_model = crate::infer::load(&path).unwrap();
+        let image_bytes = std::fs::read(dir.path().join("sample.png"))?;
+        let detections = crate::infer::predict(&inference_model, &image_bytes, 0.5).unwrap();
+        let overlay = crate::infer::overlay(&image_bytes, &samples[0].faces, &detections).unwrap();
+        assert_eq!(image::load_from_memory(&overlay)?.width(), 160);
         let difference = (restored.forward(batch.images.clone()) - after)
             .abs()
             .max()
