@@ -76,7 +76,86 @@ La source retenue est [CUHK-CSE/wider_face sur Hugging Face](https://huggingface
 
 Avant de télécharger : lire la fiche et les conditions des auteurs. Le fichier `LICENSE.md` du projet contient actuellement l'Unlicense ; cela ne change pas les droits sur les données ou sur de futurs poids de modèles. Ne pas placer les archives ou images dans le dépôt public. Vérifier séparément les conditions de publication de poids et d'illustrations du billet, notamment si le blog est monétisé ou contient des images transformées.
 
-Pour une préparation sans dépendance Python, on peut télécharger les archives directement. Le bloc suivant est une procédure à exécuter ultérieurement : il résout une révision précise et la conserve. Il n'a pas été exécuté pour rédiger ce document et télécharge environ 1,8 Go d'archives ; prévoir aussi l'espace d'extraction.
+Les archives du dépôt sont des fichiers LFS servis par le stockage **Xet** de Hugging Face. Xet découpe les gros fichiers en blocs : le téléchargement est resumable, dédupliqué entre dépôts, et les blocs sont mis en cache localement (`~/.cache/huggingface/xet` sur macOS/Linux, `%USERPROFILE%\.cache\huggingface\xet` sur Windows ; déplaçable via la variable `HF_XET_CACHE`). Aucun réglage n'est nécessaire : dès que le paquet `hf_xet` est installé, le CLI `hf` l'utilise automatiquement. Sans `hf_xet`, le téléchargement fonctionne quand même en HTTP simple (voir le bloc PowerShell plus bas, `HF_HUB_DISABLE_XET=1` force ce mode) ; Xet apporte surtout la vitesse et la reprise sur interruption.
+
+Fichiers du dépôt utiles à la première étape (révision `db171f1b7fedf4d3453e81297ff02f9915356d19`) :
+
+| Fichier | Taille | Contenu |
+|---|---|---|
+| `data/WIDER_train.zip` | ~1,5 Go | 12 880 images d'entraînement |
+| `data/WIDER_val.zip` | ~360 Mo | 3 226 images de validation |
+| `data/wider_face_split.zip` | ~3,6 Mo | annotations `wider_face_train_bbx_gt.txt`, `wider_face_val_bbx_gt.txt` |
+| `data/WIDER_test.zip` | ~1,8 Go | images de test sans annotations publiées — inutile pour commencer |
+
+Soit environ 1,8 Go compressés pour les trois archives nécessaires ; prévoir aussi l'espace une fois extraites.
+
+### Installer le CLI `hf` avec Xet
+
+**macOS** (au choix) :
+
+```bash
+# avec uv (recommandé, Python embarqué, rien d'autre à installer)
+uv tool install "huggingface_hub[hf_xet]"
+# ou avec pip
+python3 -m pip install -U --user "huggingface_hub[hf_xet]"
+```
+
+**Windows** (PowerShell, au choix) :
+
+```powershell
+# avec uv (winget install astral-sh.uv) — pas besoin de Python système
+uv tool install "huggingface_hub[hf_xet]"
+# ou avec pip
+py -m pip install -U "huggingface_hub[hf_xet]"
+```
+
+Sans installation globale, `uvx` exécute le CLI à la volée sur les deux OS : `uvx --from "huggingface_hub[hf_xet]" hf --version`.
+
+### Télécharger le dataset en local (commande identique sur macOS et Windows)
+
+Épingler la révision résolue et télécharger dans `data/raw/<révision>` depuis la racine du projet :
+
+```bash
+hf download CUHK-CSE/wider_face \
+  --repo-type dataset \
+  --revision db171f1b7fedf4d3453e81297ff02f9915356d19 \
+  --include "data/WIDER_train.zip" \
+  --include "data/WIDER_val.zip" \
+  --include "data/wider_face_split.zip" \
+  --local-dir "data/raw/db171f1b7fedf4d3453e81297ff02f9915356d19"
+```
+
+- `--local-dir` écrit de vrais fichiers (pas de liens symboliques) ; sans cette option, les fichiers vont dans le cache HF (`~/.cache/huggingface/hub`) et les blocs Xet dans `~/.cache/huggingface/xet`.
+- `--include` filtre les fichiers (répéter l'option) ; `--dry-run` liste ce qui serait téléchargé sans rien écrire.
+- Équivalent Python : `snapshot_download(repo_id="CUHK-CSE/wider_face", repo_type="dataset", revision=..., allow_patterns=["data/*.zip"], local_dir=...)`.
+
+Pendant la rédaction de ce document, cette commande a été exécutée sur macOS avec le petit `data/wider_face_split.zip` : le zip contient bien `wider_face_split/wider_face_train_bbx_gt.txt` et `wider_face_val_bbx_gt.txt`.
+
+Enregistrer ensuite la provenance et extraire.
+
+```bash
+# macOS
+REV=db171f1b7fedf4d3453e81297ff02f9915356d19
+echo "$REV" > "data/raw/$REV/revision.txt"
+shasum -a 256 data/raw/$REV/data/*.zip | tee "data/raw/$REV/sha256.txt"
+mkdir -p "data/extracted/$REV"
+for z in data/raw/$REV/data/*.zip; do unzip -q "$z" -d "data/extracted/$REV"; done
+```
+
+```powershell
+# Windows
+$rev = 'db171f1b7fedf4d3453e81297ff02f9915356d19'
+$rev | Set-Content "data/raw/$rev/revision.txt"
+Get-FileHash "data/raw/$rev/data/*.zip" -Algorithm SHA256 |
+    Select-Object Path, Hash |
+    Export-Csv "data/raw/$rev/sha256.csv" -NoTypeInformation
+New-Item -ItemType Directory -Force "data/extracted/$rev" | Out-Null
+foreach ($z in Get-ChildItem "data/raw/$rev/data/*.zip") {
+    Expand-Archive -LiteralPath $z.FullName -DestinationPath "data/extracted/$rev"
+}
+```
+
+Solution de repli **sans Python ni Xet** : télécharger les archives directement en HTTP. Le bloc suivant résout une révision précise et la conserve ; il télécharge environ 1,8 Go d'archives.
 
 ```powershell
 Set-Location C:\dev\BurnLearning2026
@@ -332,6 +411,7 @@ Pour chaque jalon, conserver une commande reproductible, la configuration, le te
 - [Boucle d'entraînement Burn](https://burn.dev/books/burn/custom-training-loop.html).
 - [Import ONNX dans Burn](https://burn.dev/books/burn/onnx-import.html).
 - [Fiche WIDER FACE sur Hugging Face](https://huggingface.co/datasets/CUHK-CSE/wider_face).
+- [Xet sur le Hub Hugging Face](https://huggingface.co/docs/hub/en/xet) — stockage par blocs des gros fichiers LFS, utilisé automatiquement par le CLI `hf` quand `hf_xet` est installé.
 - [Archives WIDER FACE](https://huggingface.co/datasets/CUHK-CSE/wider_face/tree/main/data).
 - [Format lu par le chargeur Hugging Face](https://huggingface.co/datasets/CUHK-CSE/wider_face/blob/main/wider_face.py).
 - [Article WIDER FACE, Yang et al., CVPR 2016](https://arxiv.org/abs/1511.06523).
