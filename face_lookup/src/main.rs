@@ -1,10 +1,16 @@
 mod api;
+mod batch;
 mod dataset;
 mod device;
-mod render;
+mod loss;
 mod model;
+mod render;
 
-use burn::tensor::Tensor;
+use crate::batch::make_batch;
+use crate::loss::detection_loss;
+use crate::model::Model;
+use burn::module::Module;
+use burn::optim::{AdamConfig, GradientsParams};
 use device::default_device;
 
 /// How many images to fully decode; the rest are only checked for existence.
@@ -12,14 +18,6 @@ const DECODE_LIMIT: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = default_device();
-    println!("Using device: {:?}", device);
-
-    let tensor1 = Tensor::<2>::from_data([[2., 3.], [4., 5.]], &device);
-    let tensor2 = Tensor::<2>::ones_like(&tensor1);
-
-    println!("{}", tensor1 + tensor2);
-
     let annotations_path = std::env::var_os("ANNOTATIONS_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -30,6 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dataset::images_root())
         });
+
+    // Train from dataset
+    if std::env::args().any(|arg| arg == "--train") {
+        train_dataset(&annotations_path, &images_root_path)?;
+        return Ok(());
+    }
 
     // Inspect dataset as a simple console app
     if std::env::args().any(|arg| arg == "--inspect") {
@@ -47,6 +51,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    Ok(())
+}
+
+fn train_dataset(
+    annotations_path: &std::path::Path,
+    images_root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let device = default_device().autodiff();
+    println!("Using device: {:?}", device);
+    device.seed(42);
+
+    let mut model = Model::default(&device);
+    let mut optimizer = AdamConfig::new().init();
+
+    // Petit ensemble pour commencer.
+    let samples = dataset::load_annotations(annotations_path)?
+        .take(16)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if samples.is_empty() {
+        return Err("Aucune image d'entraînement".into());
+    }
+    std::fs::create_dir_all("runs/first")?;
+
+    for epoch in 0..100 {
+        for entries in samples.chunks(4) {
+            let batch = make_batch(entries, images_root, &device)?;
+
+            let predictions = model.forward(batch.images.clone());
+            let loss = detection_loss(predictions, &batch);
+
+            println!(
+                "Époque {} : perte={:.6}, collisions={}",
+                epoch + 1,
+                loss.clone().into_scalar::<f32>(),
+                batch.collisions
+            );
+            let gradients = loss.backward();
+            let gradients = GradientsParams::from_grads(gradients, &model);
+            model = optimizer.step(1e-3, model, gradients);
+        }
+        model.clone().into_record().save("runs/first/model.bpk")?;
+    }
+
     Ok(())
 }
 

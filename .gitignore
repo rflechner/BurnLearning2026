@@ -12,3 +12,6 @@ Cargo.lock
 .DS_Store
 
 face_lookup/data/
+
+# Local training checkpoints
+runs/
