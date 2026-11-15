@@ -1,6 +1,7 @@
 mod api;
 mod dataset;
 mod device;
+mod render;
 
 use burn::tensor::Tensor;
 use device::default_device;
@@ -10,7 +11,6 @@ const DECODE_LIMIT: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
     let device = default_device();
     println!("Using device: {:?}", device);
 
@@ -47,9 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inspect_dataset(annotations_path: &std::path::Path, images_root : &std::path::Path) {
-    let train_data =
-        dataset::load_annotations(annotations_path).expect("open annotations");
+fn inspect_dataset(annotations_path: &std::path::Path, images_root: &std::path::Path) {
+    let train_data = dataset::load_annotations(annotations_path).expect("open annotations");
     let mut checked = 0;
     let mut faces = 0;
     let mut missing = 0;

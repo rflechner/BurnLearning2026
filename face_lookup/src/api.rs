@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State, rejection::QueryRejection},
     http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,9 @@ impl DatasetState {
 
 pub fn router(state: DatasetState) -> Router {
     Router::new()
+        .route("/", get(|| async { Html(include_str!("viewer.html")) }))
         .route("/api/train", get(list_images))
+        .route("/api/train/{id}/annotated", get(get_annotated_image))
         .route("/api/train/{id}/image", get(get_image))
         .with_state(Arc::new(state))
 }
@@ -57,6 +59,7 @@ struct ImageEntry<'a> {
     id: usize,
     image_file_path: &'a str,
     image_url: String,
+    annotated_image_url: String,
     faces: &'a [FaceBox],
 }
 
@@ -109,6 +112,7 @@ async fn list_images(
             id,
             image_file_path: &entry.image_file_path,
             image_url: format!("/api/train/{id}/image"),
+            annotated_image_url: format!("/api/train/{id}/annotated"),
             faces: &entry.faces,
         })
         .collect();
@@ -126,6 +130,11 @@ async fn get_image(
     State(state): State<Arc<DatasetState>>,
     Path(id): Path<usize>,
 ) -> Result<Response, ApiError> {
+    let bytes = read_image(&state, id).await?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response())
+}
+
+async fn read_image(state: &DatasetState, id: usize) -> Result<Vec<u8>, ApiError> {
     let entry = state
         .entries
         .get(id)
@@ -137,8 +146,28 @@ async fn get_image(
     if !path.starts_with(&state.images_root) {
         return Err(ApiError(StatusCode::NOT_FOUND, "Image not available"));
     }
-    let bytes = tokio::fs::read(path).await.map_err(image_io_error)?;
-    Ok(([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response())
+    tokio::fs::read(path).await.map_err(image_io_error)
+}
+
+async fn get_annotated_image(
+    State(state): State<Arc<DatasetState>>,
+    Path(id): Path<usize>,
+) -> Result<Response, ApiError> {
+    let bytes = read_image(&state, id).await?;
+    // Keep CPU-heavy decoding/drawing/encoding off Tokio's async workers.
+    let png = tokio::task::spawn_blocking(move || {
+        crate::render::annotated_png(&bytes, &state.entries[id].faces)
+    })
+    .await
+    .map_err(|error| {
+        eprintln!("Image rendering task failed: {error}");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Unable to render image")
+    })?
+    .map_err(|error| {
+        eprintln!("Image rendering failed: {error}");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Unable to render image")
+    })?;
+    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
 }
 
 fn image_io_error(error: io::Error) -> ApiError {
@@ -164,7 +193,7 @@ mod tests {
         let root = dir.path().join("images");
         std::fs::create_dir_all(root.join("event")).unwrap();
         let mut jpeg = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(2, 2)
+        image::DynamicImage::new_rgb8(12, 12)
             .write_to(&mut jpeg, image::ImageFormat::Jpeg)
             .unwrap();
         std::fs::write(root.join("event/first.jpg"), jpeg.into_inner()).unwrap();
@@ -228,10 +257,37 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 2);
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 12);
         for id in [1, 2, 99] {
             assert_eq!(
                 request(app.clone(), &format!("/api/train/{id}/image"))
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+    #[tokio::test]
+    async fn serves_viewer_and_server_rendered_overlay() {
+        let (_dir, app) = fixture();
+        let response = request(app.clone(), "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let response = request(app.clone(), "/api/train/0/annotated").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (12, 12));
+        assert_eq!(image.get_pixel(1, 2).0, [40, 230, 120]);
+        for id in [1, 2, 99] {
+            assert_eq!(
+                request(app.clone(), &format!("/api/train/{id}/annotated"))
                     .await
                     .status(),
                 StatusCode::NOT_FOUND
