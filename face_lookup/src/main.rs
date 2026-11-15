@@ -2,6 +2,7 @@ mod api;
 mod dataset;
 mod device;
 mod render;
+mod model;
 
 use burn::tensor::Tensor;
 use device::default_device;
