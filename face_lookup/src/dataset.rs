@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Lines};
 use std::iter::Peekable;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One face annotation line: `x y w h blur expression illumination invalid occlusion pose`.
 /// All original attributes are kept so the filtering policy can change later.
@@ -42,6 +42,18 @@ pub struct WiderAnnotations<R: BufRead> {
     line_no: usize,
 }
 
+pub(crate) const ANNOTATIONS_PATH: &str =
+    "data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_train_bbx_gt.txt";
+
+/// Annotation paths are relative to `WIDER_train/images/`, next to `wider_face_split/`.
+pub fn images_root() -> PathBuf {
+    Path::new(ANNOTATIONS_PATH)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|extracted| extracted.join("WIDER_train/images"))
+        .expect("annotations path has two parent directories")
+}
+
 /// Opens an annotation file and returns its lazy block iterator.
 pub fn load_annotations(path: impl AsRef<Path>) -> io::Result<WiderAnnotations<BufReader<File>>> {
     let file = File::open(path)?;
@@ -50,7 +62,7 @@ pub fn load_annotations(path: impl AsRef<Path>) -> io::Result<WiderAnnotations<B
 
 /// Streams `data/train.train` in the WIDER block format.
 pub fn load_train_data() -> io::Result<WiderAnnotations<BufReader<File>>> {
-    load_annotations("data/train.train")
+    load_annotations(ANNOTATIONS_PATH)
 }
 
 impl<R: BufRead> WiderAnnotations<R> {

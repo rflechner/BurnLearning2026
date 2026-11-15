@@ -1,8 +1,14 @@
 mod device;
 mod dataset;
 
+use std::path::{Path, PathBuf};
+
 use burn::tensor::Tensor;
 use device::default_device;
+
+
+/// How many images to fully decode; the rest are only checked for existence.
+const DECODE_LIMIT: usize = 50;
 
 fn main() {
     let device = default_device();
@@ -13,13 +19,47 @@ fn main() {
 
     // Print the element-wise addition of the two tensors.
     println!("{}", tensor1 + tensor2);
-    
-    let train_data = dataset::load_annotations("data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_train_bbx_gt.txt");
-    if let Ok(train_data) = train_data {
-        for image in train_data {
-            if let Ok(mut image) = image {
-                println!("image file: {:?}", image.image_file_path);
+
+    let train_data = dataset::load_annotations(dataset::ANNOTATIONS_PATH).expect("open annotations");
+    let images_root = dataset::images_root();
+    let mut checked = 0;
+    let mut faces = 0;
+    let mut missing = 0;
+    let mut decoded = 0;
+    let mut errors = 0;
+    for entry in train_data {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                errors += 1;
+                eprintln!("annotation error: {e}");
+                continue;
+            }
+        };
+        checked += 1;
+        faces += entry.faces.len();
+
+        let path = images_root.join(&entry.image_file_path);
+        if !path.exists() {
+            missing += 1;
+            eprintln!("missing image: {}", entry.image_file_path);
+            continue;
+        }
+        if decoded < DECODE_LIMIT {
+            match image::open(&path) {
+                Ok(img) => {
+                    println!(
+                        "decoded {} -> {}x{} px, {} face(s)",
+                        entry.image_file_path,
+                        img.width(),
+                        img.height(),
+                        entry.faces.len()
+                    );
+                    decoded += 1;
+                }
+                Err(e) => eprintln!("failed to decode {}: {e}", entry.image_file_path),
             }
         }
     }
+    println!("checked={checked} faces={faces} decoded={decoded} missing={missing} annotation_errors={errors}");
 }
