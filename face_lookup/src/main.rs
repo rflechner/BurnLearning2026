@@ -17,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tensor1 = Tensor::<2>::from_data([[2., 3.], [4., 5.]], &device);
     let tensor2 = Tensor::<2>::ones_like(&tensor1);
 
-    // Print the element-wise addition of the two tensors.
     println!("{}", tensor1 + tensor2);
 
     let annotations_path = std::env::var_os("ANNOTATIONS_PATH")
@@ -31,10 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dataset::images_root())
         });
 
+    // Inspect dataset as a simple console app
     if std::env::args().any(|arg| arg == "--inspect") {
         inspect_dataset(&*annotations_path, &*images_root_path);
         return Ok(());
     }
+
+    // Web server
     let state = api::DatasetState::load(&annotations_path, &images_root_path)?;
     let address = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
