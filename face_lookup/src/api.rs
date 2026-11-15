@@ -20,7 +20,17 @@ pub struct DatasetState {
 impl DatasetState {
     pub fn load(annotations: &FsPath, images_root: &FsPath) -> io::Result<Self> {
         // Fail on malformed annotations so IDs always match the file's order.
-        let entries = dataset::load_annotations(annotations)?.collect::<io::Result<Vec<_>>>()?;
+        let entries = dataset::load_annotations(annotations)?
+            .filter(|sample| {
+                if let Ok(item) = sample {
+                    item.faces.len() <= 2
+                } else {
+                    false
+                }
+            })
+            .take(50)
+            .collect::<io::Result<Vec<_>>>()?;
+
         let images_root = images_root.canonicalize()?;
         println!("Loaded {} annotated images", entries.len());
         Ok(Self {

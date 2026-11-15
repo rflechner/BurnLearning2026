@@ -68,13 +68,21 @@ fn train_dataset(
 
     // Petit ensemble pour commencer.
     let samples = dataset::load_annotations(annotations_path)?
+        .filter(|sample| {
+            if let Ok(item) = sample {
+                item.faces.len() <= 2
+            } else {
+                false
+            }
+        })
         .take(50)
         .collect::<Result<Vec<_>, _>>()?;
 
     if samples.is_empty() {
         return Err("Aucune image d'entraînement".into());
     }
-    std::fs::create_dir_all("runs/first")?;
+    // Nouveau dossier : les poids de runs/first ont l'ancienne architecture et ne se chargent plus.
+    std::fs::create_dir_all(RUN_DIR)?;
 
     for epoch in 0..100 {
         for (batch_index, entries) in samples.chunks(4).enumerate() {
