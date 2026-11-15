@@ -23,12 +23,12 @@ impl DatasetState {
         let entries = dataset::load_annotations(annotations)?
             .filter(|sample| {
                 if let Ok(item) = sample {
-                    item.faces.len() <= 2
+                    item.faces.len() <= 20
                 } else {
                     false
                 }
             })
-            .take(50)
+            .take(100)
             .collect::<io::Result<Vec<_>>>()?;
 
         let images_root = images_root.canonicalize()?;
