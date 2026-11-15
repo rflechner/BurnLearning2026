@@ -1,16 +1,16 @@
-mod device;
+mod api;
 mod dataset;
-
-use std::path::{Path, PathBuf};
+mod device;
 
 use burn::tensor::Tensor;
 use device::default_device;
 
-
 /// How many images to fully decode; the rest are only checked for existence.
 const DECODE_LIMIT: usize = 50;
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
     let device = default_device();
     println!("Using device: {:?}", device);
 
@@ -20,8 +20,36 @@ fn main() {
     // Print the element-wise addition of the two tensors.
     println!("{}", tensor1 + tensor2);
 
-    let train_data = dataset::load_annotations(dataset::ANNOTATIONS_PATH).expect("open annotations");
-    let images_root = dataset::images_root();
+    let annotations_path = std::env::var_os("ANNOTATIONS_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dataset::ANNOTATIONS_PATH)
+        });
+    let images_root_path = std::env::var_os("IMAGES_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dataset::images_root())
+        });
+
+    if std::env::args().any(|arg| arg == "--inspect") {
+        inspect_dataset(&*annotations_path, &*images_root_path);
+        return Ok(());
+    }
+    let state = api::DatasetState::load(&annotations_path, &images_root_path)?;
+    let address = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".into());
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    println!("Dataset API: http://{}", listener.local_addr()?);
+    axum::serve(listener, api::router(state))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
+fn inspect_dataset(annotations_path: &std::path::Path, images_root : &std::path::Path) {
+    let train_data =
+        dataset::load_annotations(annotations_path).expect("open annotations");
     let mut checked = 0;
     let mut faces = 0;
     let mut missing = 0;
@@ -61,5 +89,7 @@ fn main() {
             }
         }
     }
-    println!("checked={checked} faces={faces} decoded={decoded} missing={missing} annotation_errors={errors}");
+    println!(
+        "checked={checked} faces={faces} decoded={decoded} missing={missing} annotation_errors={errors}"
+    );
 }

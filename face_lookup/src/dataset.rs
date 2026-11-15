@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// One face annotation line: `x y w h blur expression illumination invalid occlusion pose`.
 /// All original attributes are kept so the filtering policy can change later.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FaceBox {
     pub x: u32,
     pub y: u32,
@@ -42,8 +42,7 @@ pub struct WiderAnnotations<R: BufRead> {
     line_no: usize,
 }
 
-pub(crate) const ANNOTATIONS_PATH: &str =
-    "data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_train_bbx_gt.txt";
+pub(crate) const ANNOTATIONS_PATH: &str = "data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_train_bbx_gt.txt";
 
 /// Annotation paths are relative to `WIDER_train/images/`, next to `wider_face_split/`.
 pub fn images_root() -> PathBuf {
@@ -113,7 +112,7 @@ impl<R: BufRead> Iterator for WiderAnnotations<R> {
                         "line {}: missing face count after {image_file_path:?}",
                         self.line_no + 1
                     ),
-                )))
+                )));
             }
             Some(Err(e)) => return Some(Err(e)),
             Some(Ok(l)) => l,
@@ -124,7 +123,7 @@ impl<R: BufRead> Iterator for WiderAnnotations<R> {
                 return Some(Err(invalid_data(format!(
                     "line {}: invalid face count {count_line:?}",
                     self.line_no
-                ))))
+                ))));
             }
         };
 
@@ -139,7 +138,7 @@ impl<R: BufRead> Iterator for WiderAnnotations<R> {
                             "line {}: expected {count} face lines for {image_file_path:?}",
                             self.line_no + 1
                         ),
-                    )))
+                    )));
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 Some(Ok(l)) => l,
@@ -172,7 +171,11 @@ fn parse_face_box(line_no: usize, line: &str) -> io::Result<FaceBox> {
         .split_whitespace()
         .map(|f| f.parse::<u32>())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| invalid_data(format!("line {line_no}: invalid integer in box line {line:?}")))?;
+        .map_err(|_| {
+            invalid_data(format!(
+                "line {line_no}: invalid integer in box line {line:?}"
+            ))
+        })?;
     if fields.len() != 10 {
         return Err(invalid_data(format!(
             "line {line_no}: expected 10 fields, got {} in {line:?}",
