@@ -4,6 +4,8 @@ use std::path::{Component, Path};
 
 pub const IMAGE_SIZE: usize = 320;
 pub const GRID_SIZE: usize = 40;
+/// Pixels de l'entrée couverts par une cellule de la grille.
+pub const STRIDE: f32 = (IMAGE_SIZE / GRID_SIZE) as f32;
 const CELLS: usize = GRID_SIZE * GRID_SIZE;
 
 /// Prétraitement partagé par l'entraînement et l'inférence.
@@ -28,9 +30,13 @@ pub fn prepare_image(original: &image::RgbImage) -> (Vec<f32>, u32, u32, usize, 
 
 pub struct DetectionBatch {
     pub images: Tensor<4>,        // [N, 3, 320, 320], RGB en plans séparés
-    pub presence: Tensor<4>,      // [N, 1, 40, 40]
-    pub boxes: Tensor<4>,         // [N, 4, 40, 40], dx, dy, w/320, h/320
-    pub positive_mask: Tensor<4>, // cellules avec un visage retenu
+    /// Gaussienne centrée sur chaque cellule positive (1 au centre). Les voisines voient
+    /// presque les mêmes pixels : elles restent négatives, mais pénalisées moins fort.
+    pub heatmap: Tensor<4>, // [N, 1, 40, 40]
+    /// dx, dy dans la cellule, puis ln(w / 8), ln(h / 8) : le log rend l'erreur relative,
+    /// donc comparable entre un visage de 5 px et un de 200 px.
+    pub boxes: Tensor<4>, // [N, 4, 40, 40]
+    pub positive_mask: Tensor<4>, // [N, 1, 40, 40], 1 à la cellule du centre d'un visage retenu
     pub valid_mask: Tensor<4>,    // cellules utilisables pour la présence
     pub collisions: usize,
 }
@@ -49,6 +55,7 @@ pub fn make_batch(
     let plane = IMAGE_SIZE * IMAGE_SIZE;
     let mut pixels = vec![0.0f32; n * 3 * plane];
     let mut presence = vec![0.0f32; n * CELLS];
+    let mut heatmap = vec![0.0f32; n * CELLS];
     let mut boxes = vec![0.0f32; n * 4 * CELLS];
     let mut valid = vec![1.0f32; n * CELLS];
     let mut collisions = 0;
@@ -97,8 +104,8 @@ pub fn make_batch(
             if invalid || x2 <= x1 || y2 <= y1 {
                 continue;
             }
-            let cx = (x1 + x2) / 16.0;
-            let cy = (y1 + y2) / 16.0;
+            let cx = (x1 + x2) / (2.0 * STRIDE);
+            let cy = (y1 + y2) / (2.0 * STRIDE);
             let x = (cx.floor() as usize).min(GRID_SIZE - 1);
             let y = (cy.floor() as usize).min(GRID_SIZE - 1);
             let cell = y * GRID_SIZE + x;
@@ -111,13 +118,30 @@ pub fn make_batch(
             for (channel, value) in [
                 cx - x as f32,
                 cy - y as f32,
-                (x2 - x1) / IMAGE_SIZE as f32,
-                (y2 - y1) / IMAGE_SIZE as f32,
+                ((x2 - x1) / STRIDE).ln(),
+                ((y2 - y1) / STRIDE).ln(),
             ]
             .into_iter()
             .enumerate()
             {
                 boxes[(i * 4 + channel) * CELLS + cell] = value;
+            }
+            // σ = taille / 6 : la gaussienne est quasi nulle au bord de la boîte.
+            let sigma_x = (x2 - x1) / STRIDE / 6.0;
+            let sigma_y = (y2 - y1) / STRIDE / 6.0;
+            let range = |center: usize, sigma: f32| {
+                let reach = (3.0 * sigma).ceil() as usize;
+                center.saturating_sub(reach)..(center + reach + 1).min(GRID_SIZE)
+            };
+            for gy in range(y, sigma_y) {
+                for gx in range(x, sigma_x) {
+                    let (dx, dy) = (gx as f32 - x as f32, gy as f32 - y as f32);
+                    let value = (-(dx * dx) / (2.0 * sigma_x * sigma_x)
+                        - (dy * dy) / (2.0 * sigma_y * sigma_y))
+                        .exp();
+                    let target = &mut heatmap[i * CELLS + gy * GRID_SIZE + gx];
+                    *target = target.max(value);
+                }
             }
         }
     }
@@ -128,8 +152,8 @@ pub fn make_batch(
             TensorData::new(pixels, [n, 3, IMAGE_SIZE, IMAGE_SIZE]),
             device,
         ),
-        positive_mask: presence.clone(),
-        presence,
+        positive_mask: presence,
+        heatmap: Tensor::from_data(TensorData::new(heatmap, mask_shape), device),
         boxes: Tensor::from_data(TensorData::new(boxes, [n, 4, GRID_SIZE, GRID_SIZE]), device),
         valid_mask: Tensor::from_data(TensorData::new(valid, mask_shape), device),
         collisions,
@@ -175,14 +199,21 @@ mod tests {
         let batch = make_batch(&samples, dir.path(), &device)?;
         assert_eq!(batch.images.dims(), [1, 3, 320, 320]);
         assert_eq!(batch.collisions, 1);
-        assert_eq!(batch.presence.clone().sum().into_scalar::<f32>(), 1.0);
+        assert_eq!(batch.positive_mask.clone().sum().into_scalar::<f32>(), 1.0);
         // Letterbox : image 320x160, marge verticale 80, centre (112,144).
         let cell = 18 * GRID_SIZE + 14;
         let targets = batch.boxes.to_data().try_to_vec::<f32>()?;
         assert_eq!(targets[cell], 0.0);
         assert_eq!(targets[CELLS + cell], 0.0);
-        assert!((targets[2 * CELLS + cell] - 0.2).abs() < 1e-6);
-        assert!((targets[3 * CELLS + cell] - 0.15).abs() < 1e-6);
+        // Boîte 64×48 px dans l'entrée : ln(64 / 8), ln(48 / 8).
+        assert!((targets[2 * CELLS + cell] - 8f32.ln()).abs() < 1e-6);
+        assert!((targets[3 * CELLS + cell] - 6f32.ln()).abs() < 1e-6);
+        let heat = batch.heatmap.to_data().try_to_vec::<f32>()?;
+        assert_eq!(heat[cell], 1.0);
+        // Voisine de droite : σx = 8 cellules / 6, donc exp(-1 / (2σx²)).
+        let sigma_x = 8.0f32 / 6.0;
+        assert!((heat[cell + 1] - (-1.0 / (2.0 * sigma_x * sigma_x)).exp()).abs() < 1e-6);
+        assert_eq!(heat[0], 0.0);
         let pixels = batch.images.to_data().try_to_vec::<f32>()?;
         assert_eq!(pixels[0], 0.0);
         assert_eq!(pixels[80 * IMAGE_SIZE], 1.0);

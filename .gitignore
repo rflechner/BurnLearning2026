@@ -15,3 +15,5 @@ face_lookup/data/
 
 # Local training checkpoints
 runs/
+
+.claude/

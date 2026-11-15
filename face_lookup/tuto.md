@@ -239,17 +239,21 @@ Image RGB 320 × 320
   → convolution 3 × 3, 16 canaux, pas 2 + ReLU
   → convolution 3 × 3, 32 canaux, pas 2 + ReLU
   → convolution 3 × 3, 64 canaux, pas 2 + ReLU
-  → convolution 3 × 3, 64 canaux, pas 1 + ReLU
+  → 4 convolutions 3 × 3, 64 canaux, pas 1, dilatations 1, 2, 4, 8 + ReLU
   → tête 1 × 1 : 5 valeurs par cellule
 ```
 
 Avec un padding approprié, la grille de sortie est de 40 × 40. Chaque cellule propose un score de présence et quatre paramètres de boîte. Le nombre de paramètres sera calculé à partir du modèle réellement implémenté.
 
+Vérifier le **champ récepteur** : la zone de l'image qu'une cellule peut voir. Une première version sans dilatation plafonnait à 31 px, alors que la taille médiane des visages était de 47 px dans l'entrée. Les cellules ne voyaient qu'un morceau de peau : faux positifs sur les mains, tailles devinées. Les dilatations le portent à 255 px sans réduire la grille.
+
+Initialiser les biais de la tête avec un a priori : score de présence ≈ 0,1 et taille ≈ 40 px. Sinon, les 1 600 cellules de fond démarrent à 0,5 et dominent la perte.
+
 Définir le contrat mathématique avant de coder la perte :
 
 - Une boîte est affectée à la cellule contenant son centre.
 - Les deux décalages du centre sont exprimés dans la cellule et contraints dans `[0, 1]` au décodage.
-- Largeur et hauteur sont exprimées relativement à la taille de l'entrée, avec une transformation garantissant des valeurs positives.
+- Largeur et hauteur sont prédites en `ln(taille / 8)` : `exp` garantit des valeurs positives, et l'erreur devient relative, donc comparable entre petits et grands visages.
 - La présence est un logit pendant l'entraînement, puis un score après sigmoid.
 - En cas de plusieurs centres dans la même cellule, appliquer une règle déterministe et compter ces collisions. Cette première tête ne peut pas représenter tous ces visages simultanément.
 
@@ -265,7 +269,7 @@ Le premier objectif est de **surapprendre volontairement 8 à 16 images** : le m
 
 1. Fixer la graine aléatoire et désactiver les augmentations.
 2. Construire les cibles positives, négatives et ignorées.
-3. Combiner une perte de présence adaptée au déséquilibre fond/visage et une perte de localisation, par exemple Smooth L1 sur les cellules positives.
+3. Combiner une perte de présence adaptée au déséquilibre fond/visage et une perte de localisation sur les cellules positives. Ici : une focal loss à la CenterNet, où les voisines d'un centre restent négatives mais sont moins pénalisées selon une gaussienne, et une L1 sur les décalages et les log-tailles. Éviter une Smooth L1 de seuil 1 sur des cibles dans `[0, 1]` : elle devient quadratique, et une erreur de 20 px ne coûte presque rien.
 4. Normaliser explicitement les pertes ; éviter toute division par zéro pour une image sans positif.
 5. Essayer Adam avec un taux initial de `1e-3`, sans considérer cette valeur comme validée.
 6. Journaliser séparément les deux pertes et le nombre de positifs.

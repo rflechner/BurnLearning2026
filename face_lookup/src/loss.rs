@@ -1,43 +1,49 @@
 use crate::batch::DetectionBatch;
 use burn::tensor::{
     Tensor,
-    activation::{sigmoid, softplus},
+    activation::{log_sigmoid, sigmoid},
 };
 
-/// Présence : BCE stable sur logits, positifs et négatifs normalisés séparément.
-/// Boîtes : Smooth L1 sur les seules cellules positives, après décodage.
+/// Présence : focal loss façon CenterNet, normalisée par le nombre de positifs.
+/// Le facteur p² rend négligeables les milliers de cellules de fond déjà bien classées,
+/// et (1 − gaussienne)⁴ allège la pénalité des voisines d'un centre.
+/// Boîtes : L1 sur les seules cellules positives, gradient constant même pour une petite erreur.
 pub fn detection_loss(predictions: Tensor<4>, batch: &DetectionBatch) -> DetectionLoss {
     let [n, _, h, w] = predictions.dims();
     let logits = predictions.clone().slice([0..n, 0..1, 0..h, 0..w]);
-    let bce = logits.clone().clamp_min(0.0) - logits.clone() * batch.presence.clone()
-        + ((-logits.abs()).exp() + 1.0).log();
+    let score = sigmoid(logits.clone());
+    // log(p) et log(1 − p) calculés depuis les logits, stables même quand p arrondit à 0 ou 1.
+    let log_score = log_sigmoid(logits.clone());
+    let log_background = log_sigmoid(logits.neg());
     let positive = batch.positive_mask.clone();
-    let negative = (batch.presence.clone().neg() + 1.0) * batch.valid_mask.clone();
     let positive_count = positive.clone().sum().clamp_min(1.0);
-    let presence_loss = (bce.clone() * positive.clone()).sum() / positive_count.clone()
-        + (bce * negative.clone()).sum() / negative.sum().clamp_min(1.0);
+    let positive_loss =
+        (score.clone().neg() + 1.0).powi_scalar(2) * log_score.neg() * positive.clone();
+    let negative_weight = (batch.heatmap.clone().neg() + 1.0).powi_scalar(4)
+        * (positive.clone().neg() + 1.0)
+        * batch.valid_mask.clone();
+    let negative_loss = score.powi_scalar(2) * log_background.neg() * negative_weight;
+    let presence_loss = (positive_loss.sum() + negative_loss.sum()) / positive_count.clone();
     let offsets = sigmoid(predictions.clone().slice([0..n, 1..3, 0..h, 0..w]));
-    let sizes = softplus(predictions.slice([0..n, 3..5, 0..h, 0..w]), 1.0);
-    let error = (Tensor::cat(vec![offsets, sizes.clone()], 1) - batch.boxes.clone()).abs();
-    let quadratic = error.clone().clamp_max(1.0);
-    let smooth_l1 = quadratic.clone() * quadratic.clone() * 0.5 + error - quadratic;
-    let box_loss = (smooth_l1 * positive).sum() / (positive_count * 4.0);
+    let log_sizes = predictions.slice([0..n, 3..5, 0..h, 0..w]);
+    let error = (Tensor::cat(vec![offsets, log_sizes.clone()], 1) - batch.boxes.clone()).abs();
+    let box_loss = (error * positive).sum() / (positive_count * 4.0);
     DetectionLoss {
         total: presence_loss.clone() + box_loss.clone() * LOCALIZATION_WEIGHT,
         presence: presence_loss,
         localization: box_loss,
-        predicted_sizes: sizes,
+        predicted_log_sizes: log_sizes,
     }
 }
 
-pub const LOCALIZATION_WEIGHT: f32 = 5.0;
+pub const LOCALIZATION_WEIGHT: f32 = 1.0;
 
 pub struct DetectionLoss {
     pub total: Tensor<1>,
     pub presence: Tensor<1>,
-    /// Perte brute : sa contribution au total est multipliée par 5.
+    /// Perte brute : sa contribution au total est multipliée par `LOCALIZATION_WEIGHT`.
     pub localization: Tensor<1>,
-    predicted_sizes: Tensor<4>,
+    predicted_log_sizes: Tensor<4>,
 }
 
 impl DetectionLoss {
@@ -51,7 +57,7 @@ impl DetectionLoss {
         let presence = self.presence.clone().into_scalar::<f32>();
         let localization = self.localization.clone().into_scalar::<f32>();
         // Lire des copies pour les logs sans modifier le graphe utilisé par backward().
-        let predicted = self.predicted_sizes.to_data().try_to_vec::<f32>()?;
+        let predicted = self.predicted_log_sizes.to_data().try_to_vec::<f32>()?;
         let expected = batch.boxes.to_data().try_to_vec::<f32>()?;
         let mask = batch.positive_mask.to_data().try_to_vec::<f32>()?;
         let [n, _, h, w] = batch.boxes.dims();
@@ -67,10 +73,11 @@ impl DetectionLoss {
                 }
                 count += 1;
                 for channel in 0..2 {
-                    let p = predicted[(image * 2 + channel) * cells + cell] as f64
-                        * crate::batch::IMAGE_SIZE as f64;
-                    let t = expected[(image * 4 + channel + 2) * cells + cell] as f64
-                        * crate::batch::IMAGE_SIZE as f64;
+                    // Repasser des log-tailles aux pixels ; borner pour un affichage fini.
+                    let to_pixels =
+                        |v: f32| (v as f64).min(20.0).exp() * crate::batch::STRIDE as f64;
+                    let p = to_pixels(predicted[(image * 2 + channel) * cells + cell]);
+                    let t = to_pixels(expected[(image * 4 + channel + 2) * cells + cell]);
                     predicted_sum[channel] += p;
                     expected_sum[channel] += t;
                     absolute_error[channel] += (p - t).abs();

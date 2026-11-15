@@ -16,6 +16,8 @@ use device::default_device;
 
 /// How many images to fully decode; the rest are only checked for existence.
 const DECODE_LIMIT: usize = 50;
+/// Dossier des poids entraînés, sous `runs/` pour apparaître dans le viewer.
+const RUN_DIR: &str = "runs/dilated";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,7 +105,7 @@ fn train_dataset(
             let gradients = GradientsParams::from_grads(gradients, &model);
             model = optimizer.step(1e-3, model, gradients);
         }
-        model.clone().into_record().save("runs/first/model.bpk")?;
+        model.clone().into_record().save(format!("{RUN_DIR}/model.bpk"))?;
     }
 
     Ok(())

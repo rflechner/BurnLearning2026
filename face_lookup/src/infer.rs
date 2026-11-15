@@ -47,9 +47,6 @@ fn sigmoid(x: f32) -> f32 {
         e / (1.0 + e)
     }
 }
-fn softplus(x: f32) -> f32 {
-    x.max(0.0) + (-x.abs()).exp().ln_1p()
-}
 fn iou(a: &Detection, b: &Detection) -> f32 {
     let intersection =
         (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0.0) * (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0.0);
@@ -78,8 +75,10 @@ fn decode(
         }
         let cx = ((cell % 40) as f32 + sigmoid(values[1600 + cell])) * 8.0;
         let cy = ((cell / 40) as f32 + sigmoid(values[3200 + cell])) * 8.0;
-        let w = softplus(values[4800 + cell]) * 320.0;
-        let h = softplus(values[6400 + cell]) * 320.0;
+        // Tailles prédites en ln(px / 8) ; borner avant exp pour éviter l'infini.
+        let stride = crate::batch::STRIDE;
+        let w = values[4800 + cell].min(8.0).exp() * stride;
+        let h = values[6400 + cell].min(8.0).exp() * stride;
         let sx = width as f32 / ow as f32;
         let sy = height as f32 / oh as f32;
         let d = Detection {
@@ -151,8 +150,8 @@ mod tests {
         values[cell] = 10.0;
         values[1600 + cell] = 0.0;
         values[3200 + cell] = 0.0;
-        values[4800 + cell] = (0.2f32.exp() - 1.0).ln();
-        values[6400 + cell] = (0.15f32.exp() - 1.0).ln();
+        values[4800 + cell] = 8f32.ln();
+        values[6400 + cell] = 6f32.ln();
         let detections = decode(&values, 160, 80, 320, 160, 0, 80, 0.5).unwrap();
         assert_eq!(detections.len(), 1);
         let d = &detections[0];
@@ -175,8 +174,8 @@ mod tests {
             values[cell] = 10.0;
             values[1600 + cell] = 0.0;
             values[3200 + cell] = 0.0;
-            values[4800 + cell] = (0.2f32.exp() - 1.0).ln();
-            values[6400 + cell] = (0.15f32.exp() - 1.0).ln();
+            values[4800 + cell] = 8f32.ln();
+            values[6400 + cell] = 6f32.ln();
         }
         assert_eq!(
             decode(&values, 160, 80, 320, 160, 0, 80, 0.5)
