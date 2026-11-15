@@ -8,14 +8,14 @@ Depuis la racine du dépôt :
 cargo run --manifest-path face_lookup/Cargo.toml
 ```
 
-Le serveur écoute sur `http://127.0.0.1:3000`. Les annotations sont chargées une
+Le serveur écoute sur `http://127.0.0.1:3001`. Les annotations sont chargées une
 seule fois au démarrage ; les JPEG sont lus à la demande, sans décodage ni modification.
 Une annotation invalide empêche le démarrage avec une erreur de parsing.
 
 ### Parcourir les images
 
 ```sh
-curl 'http://127.0.0.1:3000/api/train?page=1&page_size=20'
+curl 'http://127.0.0.1:3001/api/train?page=1&page_size=20'
 ```
 
 La réponse JSON contient `page`, `page_size`, `total`, `total_pages` et `items`.
@@ -31,7 +31,7 @@ d'annotations ne change pas.
 ### Récupérer une image
 
 ```sh
-curl 'http://127.0.0.1:3000/api/train/0/image' -o image.jpg
+curl 'http://127.0.0.1:3001/api/train/0/image' -o image.jpg
 ```
 
 Renvoie le JPEG original avec `Content-Type: image/jpeg`. Un identifiant inconnu
@@ -42,7 +42,7 @@ annotations et situés dans le dossier des images sont accessibles.
 
 Variables d'environnement facultatives :
 
-- `BIND_ADDR` : adresse d'écoute (défaut `127.0.0.1:3000`).
+- `BIND_ADDR` : adresse d'écoute (défaut `127.0.0.1:3001`).
 - `ANNOTATIONS_PATH` : chemin du fichier d'annotations WIDER FACE.
 - `IMAGES_ROOT` : dossier racine contenant les images (sous-dossiers inclus).
 
@@ -63,3 +63,21 @@ Tests de l'API (pagination, annotations, JPEG, erreurs et confinement des chemin
 ```sh
 cargo test --manifest-path face_lookup/Cargo.toml
 ```
+
+## Visualisation des visages
+
+Ouvrir `http://127.0.0.1:3001/` après le lancement du serveur : la page HTML
+utilise l'API pour afficher une grille paginée (12, 24 ou 48 images), avec accès
+direct à une page. La case « Zones des visages » alterne entre l'original et
+l'image annotée ; cliquer sur une image ouvre sa version en taille réelle.
+
+`GET /api/train/{id}/annotated` renvoie un **PNG** avec les rectangles dessinés
+côté serveur, en vert pour les annotations valides et orange pour celles dont
+`invalid` est non nul. Les coordonnées restent celles de l'image originale ;
+les rectangles vides sont ignorés et les rectangles débordants sont bornés à
+l'image. La liste JSON fournit aussi `annotated_image_url`.
+
+Le module `face_lookup/src/render.rs` contient `draw_face_boxes(&mut RgbImage,
+&[FaceBox])`, réutilisable sans HTTP ni accès aux fichiers, et `annotated_png`
+pour le décodage/rendu/encodage. Le serveur exécute ce traitement dans
+`spawn_blocking`. Les fichiers originaux ne sont jamais modifiés.
