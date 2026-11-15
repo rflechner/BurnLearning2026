@@ -191,8 +191,15 @@ mod tests {
         let before = model.forward(batch.images.clone());
         assert_eq!(before.dims(), [1, 5, 40, 40]);
         let loss = crate::loss::detection_loss(before.clone(), &batch);
-        assert!(loss.clone().into_scalar::<f32>().is_finite());
-        let gradients = GradientsParams::from_grads(loss.backward(), &model);
+        assert!(loss.total.clone().into_scalar::<f32>().is_finite());
+        let diagnostics = loss.diagnostics(&batch)?;
+        assert!(diagnostics.contains("positifs=1"));
+        assert!(diagnostics.contains("attendue=64.00×48.00px"));
+        let total = loss.total.clone().into_scalar::<f32>();
+        let parts = loss.presence.clone().into_scalar::<f32>()
+            + loss.localization.clone().into_scalar::<f32>() * crate::loss::LOCALIZATION_WEIGHT;
+        assert!((total - parts).abs() < 1e-5);
+        let gradients = GradientsParams::from_grads(loss.total.backward(), &model);
         model = AdamConfig::new().init().step(1e-3, model, gradients);
         let after = model.forward(batch.images.clone());
         let change = (after.clone() - before).abs().sum().into_scalar::<f32>();
@@ -217,8 +224,16 @@ mod tests {
         let batch = make_batch(&empty, dir.path(), &device)?;
         assert!(
             crate::loss::detection_loss(restored.forward(batch.images.clone()), &batch)
+                .total
                 .into_scalar::<f32>()
                 .is_finite()
+        );
+        let empty_loss =
+            crate::loss::detection_loss(restored.forward(batch.images.clone()), &batch);
+        assert!(
+            empty_loss
+                .diagnostics(&batch)?
+                .contains("tailles=n/a (aucun positif)")
         );
         Ok(())
     }

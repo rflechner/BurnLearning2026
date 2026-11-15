@@ -68,7 +68,7 @@ fn train_dataset(
 
     // Petit ensemble pour commencer.
     let samples = dataset::load_annotations(annotations_path)?
-        //.take(16)
+        .take(50)
         .collect::<Result<Vec<_>, _>>()?;
 
     if samples.is_empty() {
@@ -77,19 +77,21 @@ fn train_dataset(
     std::fs::create_dir_all("runs/first")?;
 
     for epoch in 0..100 {
-        for entries in samples.chunks(4) {
+        for (batch_index, entries) in samples.chunks(4).enumerate() {
             let batch = make_batch(entries, images_root, &device)?;
 
             let predictions = model.forward(batch.images.clone());
             let loss = detection_loss(predictions, &batch);
 
             println!(
-                "Époque {} : perte={:.6}, collisions={}",
+                "Époque {} · lot {}/{} : {}, collisions={}",
                 epoch + 1,
-                loss.clone().into_scalar::<f32>(),
+                batch_index + 1,
+                samples.len().div_ceil(4),
+                loss.diagnostics(&batch)?,
                 batch.collisions
             );
-            let gradients = loss.backward();
+            let gradients = loss.total.backward();
             let gradients = GradientsParams::from_grads(gradients, &model);
             model = optimizer.step(1e-3, model, gradients);
         }
