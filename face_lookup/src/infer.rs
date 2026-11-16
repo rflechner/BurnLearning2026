@@ -20,6 +20,40 @@ pub fn predict(model: &Model, bytes: &[u8], threshold: f32) -> Result<Vec<Detect
     let image = image::load_from_memory(bytes)
         .map_err(|e| e.to_string())?
         .to_rgb8();
+    predict_image(model, &image, threshold)
+}
+
+/// Plus grand côté conservé pour une photo envoyée : le modèle ne voit que 320 px,
+/// et dessiner puis encoder en PNG une photo de 24 Mpx prendrait plusieurs secondes.
+pub const UPLOAD_MAX_SIDE: u32 = 1600;
+
+/// Décode une photo envoyée par l'utilisateur : applique l'orientation EXIF (sinon une
+/// photo de téléphone en portrait arrive couchée) puis réduit sa taille d'affichage.
+pub fn load_upload(bytes: &[u8]) -> Result<image::RgbImage, String> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    image.apply_orientation(orientation);
+    if image.width().max(image.height()) > UPLOAD_MAX_SIDE {
+        image = image.resize(
+            UPLOAD_MAX_SIDE,
+            UPLOAD_MAX_SIDE,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    Ok(image.to_rgb8())
+}
+
+pub fn predict_image(
+    model: &Model,
+    image: &image::RgbImage,
+    threshold: f32,
+) -> Result<Vec<Detection>, String> {
     let (ow, oh) = image.dimensions();
     let device = crate::device::default_device();
     let (pixels, width, height, left, top) = crate::batch::prepare_image(&image);
@@ -107,11 +141,23 @@ pub fn overlay(
     faces: &[crate::dataset::FaceBox],
     detections: &[Detection],
 ) -> Result<Vec<u8>, String> {
-    let mut image = image::load_from_memory(bytes)
+    let image = image::load_from_memory(bytes)
         .map_err(|e| e.to_string())?
         .to_rgb8();
+    overlay_image(image, faces, detections)
+}
+
+/// Dessine annotations (vert) et prédictions (rouge), puis encode en PNG.
+pub fn overlay_image(
+    mut image: image::RgbImage,
+    faces: &[crate::dataset::FaceBox],
+    detections: &[Detection],
+) -> Result<Vec<u8>, String> {
     crate::render::draw_face_boxes(&mut image, faces);
     let (w, h) = image.dimensions();
+    if w == 0 || h == 0 {
+        return Err("Image vide".into());
+    }
     for d in detections {
         let (x1, y1, x2, y2) = (
             d.x1.floor() as u32,
@@ -205,5 +251,29 @@ mod tests {
         let image = image::load_from_memory(&result).unwrap().to_rgb8();
         assert_eq!(image.get_pixel(2, 3).0, [255, 65, 65]);
         assert_eq!(image.get_pixel(5, 6).0, [0, 0, 0]);
+    }
+    #[test]
+    fn upload_applies_exif_orientation_and_limits_size() {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(40, 20)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+        // Segment APP1 minimal : TIFF big-endian, une entrée Orientation = 6 (rotation 90° horaire).
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0MM\0\x2a\0\0\0\x08");
+        app1.extend_from_slice(&[0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0]);
+        let rotated = [&jpeg[..2], &app1, &jpeg[2..]].concat();
+        let image = load_upload(&rotated).unwrap();
+        assert_eq!(image.dimensions(), (20, 40));
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(3200, 1000)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let image = load_upload(png.get_ref()).unwrap();
+        assert_eq!(image.dimensions(), (UPLOAD_MAX_SIDE, 500));
+
+        assert!(load_upload(b"pas une image").is_err());
     }
 }
