@@ -1,11 +1,16 @@
 //! Inférence : même letterboxing que l'entraînement, décodage puis NMS.
-use crate::model::Model;
+use crate::{detection_config::DetectionConfig, model::Model};
 use burn::{
     module::Module,
     store::ModuleRecord,
     tensor::{Tensor, TensorData},
 };
 use std::path::Path;
+
+pub struct InferenceModel {
+    pub network: Model,
+    pub config: DetectionConfig,
+}
 
 #[derive(Clone, Debug)]
 pub struct Detection {
@@ -16,15 +21,19 @@ pub struct Detection {
     pub score: f32,
 }
 
-pub fn predict(model: &Model, bytes: &[u8], threshold: f32) -> Result<Vec<Detection>, String> {
+pub fn predict(
+    model: &InferenceModel,
+    bytes: &[u8],
+    threshold: f32,
+) -> Result<Vec<Detection>, String> {
     let image = image::load_from_memory(bytes)
         .map_err(|e| e.to_string())?
         .to_rgb8();
     predict_image(model, &image, threshold)
 }
 
-/// Plus grand côté conservé pour une photo envoyée : le modèle ne voit que 320 px,
-/// et dessiner puis encoder en PNG une photo de 24 Mpx prendrait plusieurs secondes.
+/// Plus grand côté conservé pour une photo envoyée, supérieur aux résolutions du réseau.
+/// Dessiner puis encoder en PNG une photo de 24 Mpx prendrait plusieurs secondes.
 pub const UPLOAD_MAX_SIDE: u32 = 1600;
 
 /// Décode une photo envoyée par l'utilisateur : applique l'orientation EXIF (sinon une
@@ -50,27 +59,32 @@ pub fn load_upload(bytes: &[u8]) -> Result<image::RgbImage, String> {
 }
 
 pub fn predict_image(
-    model: &Model,
+    model: &InferenceModel,
     image: &image::RgbImage,
     threshold: f32,
 ) -> Result<Vec<Detection>, String> {
     let (ow, oh) = image.dimensions();
     let device = crate::device::default_device();
-    let (pixels, width, height, left, top) = crate::batch::prepare_image(&image);
-    let input = Tensor::from_data(TensorData::new(pixels, [1, 3, 320, 320]), &device);
+    let config = model.config;
+    let size = config.image_size();
+    let (pixels, width, height, left, top) = crate::batch::prepare_image(image, config);
+    let input = Tensor::from_data(TensorData::new(pixels, [1, 3, size, size]), &device);
     let output = model
+        .network
         .forward(input)
         .into_data()
         .try_to_vec::<f32>()
         .map_err(|e| e.to_string())?;
-    decode(&output, ow, oh, width, height, left, top, threshold)
+    decode(&output, ow, oh, width, height, left, top, threshold, config)
 }
 
-pub fn load(path: &Path) -> Result<Model, String> {
+pub fn load(path: &Path) -> Result<InferenceModel, String> {
+    let config = DetectionConfig::for_weights(path).map_err(|e| e.to_string())?;
     let record = ModuleRecord::load(path).map_err(|e| e.to_string())?;
-    Model::default(&crate::device::default_device())
+    let network = Model::default(&crate::device::default_device())
         .try_load_record(record)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(InferenceModel { network, config })
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -97,22 +111,25 @@ fn decode(
     left: usize,
     top: usize,
     threshold: f32,
+    config: DetectionConfig,
 ) -> Result<Vec<Detection>, String> {
-    if values.len() != 8000 || values.iter().any(|v| !v.is_finite()) {
+    let grid = config.grid_size();
+    let cells = grid * grid;
+    if values.len() != 5 * cells || values.iter().any(|v| !v.is_finite()) {
         return Err("Sortie du modèle invalide".into());
     }
     let mut candidates = Vec::new();
-    for cell in 0..1600 {
+    for cell in 0..cells {
         let score = sigmoid(values[cell]);
         if score < threshold {
             continue;
         }
-        let cx = ((cell % 40) as f32 + sigmoid(values[1600 + cell])) * 8.0;
-        let cy = ((cell / 40) as f32 + sigmoid(values[3200 + cell])) * 8.0;
+        let cx = ((cell % grid) as f32 + sigmoid(values[cells + cell])) * crate::batch::STRIDE;
+        let cy = ((cell / grid) as f32 + sigmoid(values[2 * cells + cell])) * crate::batch::STRIDE;
         // Tailles prédites en ln(px / 8) ; borner avant exp pour éviter l'infini.
         let stride = crate::batch::STRIDE;
-        let w = values[4800 + cell].min(8.0).exp() * stride;
-        let h = values[6400 + cell].min(8.0).exp() * stride;
+        let w = values[3 * cells + cell].min(8.0).exp() * stride;
+        let h = values[4 * cells + cell].min(8.0).exp() * stride;
         let sx = width as f32 / ow as f32;
         let sy = height as f32 / oh as f32;
         let d = Detection {
@@ -190,6 +207,39 @@ pub fn overlay_image(
 mod tests {
     use super::*;
     #[test]
+    fn decodes_high_resolution_grid_and_letterbox() {
+        let config = DetectionConfig::new(640).unwrap();
+        let cells = 80 * 80;
+        let mut values = vec![-100.0; 5 * cells];
+        let cell = 40 * 80 + 60;
+        values[cell] = 10.0;
+        values[cells + cell] = 0.0;
+        values[2 * cells + cell] = 0.0;
+        values[3 * cells + cell] = 8f32.ln();
+        values[4 * cells + cell] = 6f32.ln();
+        let detections = decode(&values, 320, 160, 640, 320, 0, 160, 0.5, config).unwrap();
+        assert_eq!(detections.len(), 1);
+        let d = &detections[0];
+        for (actual, expected) in [(d.x1, 226.0), (d.y1, 70.0), (d.x2, 258.0), (d.y2, 94.0)] {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+        assert!(
+            decode(
+                &values,
+                320,
+                160,
+                640,
+                320,
+                0,
+                160,
+                0.5,
+                DetectionConfig::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn decodes_letterbox_and_filters_background() {
         let mut values = vec![-100.0; 8000];
         let cell = 18 * 40 + 14;
@@ -198,7 +248,18 @@ mod tests {
         values[3200 + cell] = 0.0;
         values[4800 + cell] = 8f32.ln();
         values[6400 + cell] = 6f32.ln();
-        let detections = decode(&values, 160, 80, 320, 160, 0, 80, 0.5).unwrap();
+        let detections = decode(
+            &values,
+            160,
+            80,
+            320,
+            160,
+            0,
+            80,
+            0.5,
+            DetectionConfig::default(),
+        )
+        .unwrap();
         assert_eq!(detections.len(), 1);
         let d = &detections[0];
         assert!((d.x1 - 42.0).abs() < 0.001);
@@ -206,12 +267,35 @@ mod tests {
         assert!((d.x2 - 74.0).abs() < 0.001);
         assert!((d.y2 - 46.0).abs() < 0.001);
         assert!(
-            decode(&values, 160, 80, 320, 160, 0, 80, 1.0)
-                .unwrap()
-                .is_empty()
+            decode(
+                &values,
+                160,
+                80,
+                320,
+                160,
+                0,
+                80,
+                1.0,
+                DetectionConfig::default()
+            )
+            .unwrap()
+            .is_empty()
         );
         values[0] = f32::NAN;
-        assert!(decode(&values, 160, 80, 320, 160, 0, 80, 0.5).is_err());
+        assert!(
+            decode(
+                &values,
+                160,
+                80,
+                320,
+                160,
+                0,
+                80,
+                0.5,
+                DetectionConfig::default()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn nms_removes_overlapping_predictions() {
@@ -224,9 +308,19 @@ mod tests {
             values[6400 + cell] = 6f32.ln();
         }
         assert_eq!(
-            decode(&values, 160, 80, 320, 160, 0, 80, 0.5)
-                .unwrap()
-                .len(),
+            decode(
+                &values,
+                160,
+                80,
+                320,
+                160,
+                0,
+                80,
+                0.5,
+                DetectionConfig::default()
+            )
+            .unwrap()
+            .len(),
             1
         );
     }

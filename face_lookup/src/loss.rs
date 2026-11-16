@@ -72,7 +72,7 @@ impl std::fmt::Display for DetectionDiagnostics {
 
 impl DetectionLoss {
     /// Mesures avant la mise à jour, aux seules cellules positives.
-    /// Les tailles sont en pixels de l'entrée 320×320, pas de l'image originale.
+    /// Les tailles sont en pixels de l’entrée du réseau, pas de l’image originale.
     pub fn diagnostics(
         &self,
         batch: &DetectionBatch,
@@ -112,8 +112,9 @@ impl DetectionLoss {
             "tailles=n/a (aucun positif)".to_string()
         } else {
             let n = count as f64;
+            let [_, _, input_height, input_width] = batch.images.dims();
             format!(
-                "taille_moyenne_predite={:.2}×{:.2}px, attendue={:.2}×{:.2}px, erreur_absolue_moyenne={:.2}×{:.2}px (L×H, entrée 320×320)",
+                "taille_moyenne_predite={:.2}×{:.2}px, attendue={:.2}×{:.2}px, erreur_absolue_moyenne={:.2}×{:.2}px (L×H, entrée {input_width}×{input_height})",
                 predicted_sum[0] / n,
                 predicted_sum[1] / n,
                 expected_sum[0] / n,

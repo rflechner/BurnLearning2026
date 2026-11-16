@@ -3,13 +3,15 @@ use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{Initializer, PaddingConfig2d, Relu};
 use burn::tensor::{Tensor, TensorData};
 
-/// Score initial de présence (≈ 0,1) : sans cet a priori, les ~1 600 cellules de fond
+/// Score initial de présence (≈ 0,1) : sans cet a priori, les milliers de cellules de fond
 /// démarrent à 0,5 et écrasent la perte des quelques positifs.
 const PRESENCE_PRIOR: f32 = 0.1;
-/// Taille initiale des boîtes, en pixels de l'entrée 320×320 (ordre de grandeur des visages).
+/// Taille initiale des boîtes en pixels de l’entrée du réseau.
 const SIZE_PRIOR: f32 = 40.0;
 
-/// Détecteur à une échelle : grille 40×40 (pas de 8 px), 5 valeurs par cellule.
+/// Détecteur entièrement convolutionnel : pas de 8 px, 5 valeurs par cellule.
+/// La même architecture accepte 320×320 (grille 40×40) ou 640×640 (grille 80×80).
+/// La résolution du prétraitement est conservée séparément des paramètres appris.
 ///
 /// Les trois convolutions à pas 2 descendent au pas 8 ; les convolutions dilatées qui suivent
 /// élargissent le champ récepteur à 255 px sans réduire la grille. Avant, il plafonnait à
@@ -26,11 +28,18 @@ pub struct Model {
 }
 
 /// Initialisation de He, adaptée aux ReLU : la variance du signal reste stable avec la profondeur.
-fn conv(device: &burn::tensor::Device, channels: [usize; 2], stride: usize, dilation: usize) -> Conv2d {
+fn conv(
+    device: &burn::tensor::Device,
+    channels: [usize; 2],
+    stride: usize,
+    dilation: usize,
+) -> Conv2d {
     Conv2dConfig::new(channels, [3, 3])
         .with_stride([stride, stride])
         .with_dilation([dilation, dilation])
-        .with_padding(PaddingConfig2d::Explicit(dilation, dilation, dilation, dilation))
+        .with_padding(PaddingConfig2d::Explicit(
+            dilation, dilation, dilation, dilation,
+        ))
         .with_initializer(Initializer::KaimingNormal {
             gain: 2f64.sqrt(),
             fan_out_only: false,
@@ -92,7 +101,10 @@ mod tests {
         let values = output.into_data().try_to_vec::<f32>().unwrap();
         // Entrée nulle : la tête initialisée à 0,01 laisse presque uniquement les biais.
         let score = 1.0 / (1.0 + (-values[0]).exp());
-        assert!((score - PRESENCE_PRIOR).abs() < 0.02, "score initial {score}");
+        assert!(
+            (score - PRESENCE_PRIOR).abs() < 0.02,
+            "score initial {score}"
+        );
         let width = values[3 * 1600].exp() * crate::batch::STRIDE;
         assert!((width - SIZE_PRIOR).abs() < 2.0, "largeur initiale {width}");
     }

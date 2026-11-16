@@ -15,7 +15,8 @@ use crate::dataset::{self, AnnotatedImage, FaceBox};
 pub struct DatasetState {
     entries: Vec<AnnotatedImage>,
     images_root: PathBuf,
-    inference: std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, crate::model::Model)>>,
+    inference:
+        std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, crate::infer::InferenceModel)>>,
 }
 
 impl DatasetState {
@@ -387,7 +388,9 @@ async fn list_weights() -> Result<Json<Vec<String>>, ApiError> {
                 }
                 if kind.is_dir() {
                     visit(root, &entry.path(), result)?;
-                } else if entry.path().extension().is_some_and(|e| e == "bpk") {
+                } else if entry.path().extension().is_some_and(|e| e == "bpk")
+                    && entry.file_name() != "model.next.bpk"
+                {
                     result.push(
                         entry
                             .path()
@@ -572,7 +575,7 @@ async fn resolve_weights(weights: &str, threshold: f32) -> Result<PathBuf, ApiEr
 fn with_model<T>(
     state: &DatasetState,
     path: PathBuf,
-    run: impl FnOnce(&crate::model::Model) -> Result<T, String>,
+    run: impl FnOnce(&crate::infer::InferenceModel) -> Result<T, String>,
 ) -> Result<T, String> {
     let modified = std::fs::metadata(&path)
         .and_then(|m| m.modified())

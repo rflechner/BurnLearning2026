@@ -1,5 +1,15 @@
 # BurnLearning2026
 
+> **EN — Learning project, not production-ready.**
+> This repository is a personal experiment to learn the Burn deep learning framework
+> in Rust. The code, models, and results are experimental and intended for learning,
+> not for production use.
+>
+> **FR — Projet d'apprentissage, non prêt pour la production.**
+> Ce dépôt est une expérimentation personnelle pour apprendre à utiliser Burn,
+> le framework de deep learning en Rust. Le code, les modèles et les résultats sont
+> expérimentaux et destinés à l'apprentissage, pas à un usage en production.
+
 ## API REST du dataset d'entraînement
 
 Depuis la racine du dépôt :
@@ -129,8 +139,58 @@ La numérotation des époques et le taux d'apprentissage reprennent au point ind
 donc d'une reprise des poids, pas d'une continuation strictement identique du calcul.
 Sans ces options, `--train` démarre toujours un nouveau modèle à l'époque 1.
 
+### Entraîner en plus haute résolution
+
+Depuis `face_lookup`, pour un **nouveau modèle en 640×640** :
+
+```sh
+cargo run --release -- --train --image-size 640
+```
+
+Le réseau est entièrement convolutionnel : `Model::default` conserve la même
+architecture et initialise de nouveaux poids. L'entrée passe à 640×640 et la grille
+de détection à 80×80, au lieu de 320×320 et 40×40. Chaque dimension est doublée,
+soit quatre fois plus de pixels. Le champ récepteur reste de 255 pixels de l'entrée.
+Ce changement vise les petits visages ; son effet sur la qualité reste à mesurer.
+
+Les poids sont enregistrés dans **`runs/dilated-640/model.bpk`**, et les journaux dans
+ce même dossier. Le modèle 320 de `runs/dilated` est conservé. `--run-dir runs/essai-640`
+permet de choisir un autre dossier. Un dossier contenant déjà `model.bpk` est refusé
+pour un nouveau modèle ; pour continuer ce modèle, utiliser `--resume-weights`.
+La résolution d'un dossier existant ne peut pas être changée.
+
+En haute résolution, le lot par défaut est **1 image** pour limiter la mémoire GPU ;
+`--batch-size 2` permet de l'augmenter. En 320, le lot par défaut reste de 4 images.
+Les résolutions acceptées sont les multiples de 32 entre 320 et 1280. Le temps de
+calcul et la mémoire augmentent avec la résolution ; le lot plus petit modifie aussi
+le nombre de mises à jour par époque.
+
+Pour initialiser un nouvel entraînement 640 à partir des poids déjà appris en 320 :
+
+```sh
+cargo run --release -- --train --image-size 640 --resume-weights runs/dilated/model.bpk
+```
+
+Cette commande écrit également dans `runs/dilated-640`, commence à l'époque 1
+avec le calendrier de taux d'apprentissage habituel, et réinitialise Adam.
+Choisir un autre `--run-dir` si ce dossier contient déjà un modèle.
+
+Pour reprendre le modèle 640 après 10 époques terminées :
+
+```sh
+cargo run --release -- --train --resume-weights runs/dilated-640/model.bpk --start-epoch 11
+```
+
+La résolution est lue dans **`model.config.json`**, enregistré à côté des poids.
+**Conserver ces deux fichiers ensemble** (si les poids sont renommés `essai.bpk`,
+renommer aussi la configuration `essai.config.json`). Le viewer utilise automatiquement
+cette résolution à la sélection du checkpoint. Les anciens fichiers `.bpk` sans
+configuration restent interprétés en 320×320. Redémarrer le serveur après compilation
+pour utiliser le nouveau chargement. Pour reprendre dans un dossier personnalisé,
+passer de nouveau son `--run-dir`.
+
 Chaque époque entraîne le modèle sur les **12 880 images de train**, puis évalue
-les **3 226 images de val**, par lots de 4, sans filtrage par nombre de visages.
+les **3 226 images de val**, avec la taille de lot choisie, sans filtrage par nombre de visages.
 La validation emploie `model.valid()` sur un appareil sans autodiff, sans calcul
 de gradients, sans pas d'optimiseur et sans avancer le taux d'apprentissage.
 Le modèle d'entraînement conserve ses poids et son mode d'entraînement.

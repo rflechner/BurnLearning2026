@@ -1,6 +1,7 @@
 mod api;
 mod batch;
 mod dataset;
+mod detection_config;
 mod device;
 mod infer;
 mod loss;
@@ -19,8 +20,6 @@ use device::default_device;
 
 /// How many images to fully decode; the rest are only checked for existence.
 const DECODE_LIMIT: usize = 50;
-/// Dossier des poids entraînés, sous `runs/` pour apparaître dans le viewer.
-const RUN_DIR: &str = "runs/dilated";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,9 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join(dataset::validation_images_root())
             });
-        let failure = training_failure::TrainingFailure::install(std::path::Path::new(RUN_DIR))?;
         let restart =
             training_restart::TrainingRestart::parse(std::env::args_os().skip(1), EPOCHS)?;
+        restart.prepare_run_dir()?;
+        let failure = training_failure::TrainingFailure::install(&restart.run_dir)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             train_dataset(
                 &annotations_path,
@@ -117,6 +117,15 @@ fn train_dataset(
         valid_samples.len()
     );
     device.seed(42);
+    println!(
+        "Résolution : {}×{} ; grille : {}×{} ; lot : {} ; dossier : {}",
+        restart.config.image_size(),
+        restart.config.image_size(),
+        restart.config.grid_size(),
+        restart.config.grid_size(),
+        restart.batch_size,
+        restart.run_dir.display()
+    );
 
     let mut model = Model::default(&device);
     if let Some(path) = &restart.weights {
@@ -130,13 +139,10 @@ fn train_dataset(
     }
     let mut optimizer = AdamConfig::new().init();
 
-    // Nouveau dossier : les poids de runs/first ont l'ancienne architecture et ne se chargent plus.
-    std::fs::create_dir_all(RUN_DIR)?;
-
-    let batches = samples.len().div_ceil(4);
+    let batches = samples.len().div_ceil(restart.batch_size);
     let total_steps = EPOCHS * batches;
     let mut dashboard = training_ui::TrainingDashboard::new(
-        std::path::Path::new(RUN_DIR),
+        &restart.run_dir,
         EPOCHS,
         samples.len(),
         restart.first_epoch,
@@ -144,12 +150,12 @@ fn train_dataset(
     for epoch in restart.first_epoch..EPOCHS {
         dashboard.start_epoch(epoch, samples.len());
         let mut updated = false;
-        for (batch_index, entries) in samples.chunks(4).enumerate() {
+        for (batch_index, entries) in samples.chunks(restart.batch_size).enumerate() {
             if dashboard.should_stop() {
                 break;
             }
             failure.context(batch_context(epoch, "Train", batch_index, entries));
-            let batch = make_batch(entries, images_root, &device)?;
+            let batch = make_batch(entries, images_root, &device, restart.config)?;
 
             let predictions = model.forward(batch.images.clone());
             let loss = detection_loss(predictions, &batch);
@@ -168,11 +174,11 @@ fn train_dataset(
             model
                 .clone()
                 .into_record()
-                .save(format!("{RUN_DIR}/model.next.bpk"))?;
+                .save(restart.run_dir.join("model.next.bpk"))?;
             // Publier uniquement un checkpoint complètement écrit.
             std::fs::rename(
-                format!("{RUN_DIR}/model.next.bpk"),
-                format!("{RUN_DIR}/model.bpk"),
+                restart.run_dir.join("model.next.bpk"),
+                restart.run_dir.join("model.bpk"),
             )?;
         }
         if dashboard.should_stop() {
@@ -182,12 +188,12 @@ fn train_dataset(
         // Une vue d'inférence des poids courants ; le modèle d'entraînement reste intact.
         let valid_model = model.valid();
         dashboard.start_validation(valid_samples.len());
-        for (batch_index, entries) in valid_samples.chunks(4).enumerate() {
+        for (batch_index, entries) in valid_samples.chunks(restart.batch_size).enumerate() {
             if dashboard.should_stop() {
                 break;
             }
             failure.context(batch_context(epoch, "Valid", batch_index, entries));
-            let batch = make_batch(entries, valid_images_root, &valid_device)?;
+            let batch = make_batch(entries, valid_images_root, &valid_device, restart.config)?;
             let diagnostics = validation_diagnostics(&valid_model, &batch)?;
             dashboard.update_valid(&diagnostics, entries.len(), batch.collisions)?;
         }
@@ -199,12 +205,14 @@ fn train_dataset(
     let interrupted = dashboard.should_stop();
     dashboard.finish()?;
     println!(
-        "Entraînement {}. Poids : {RUN_DIR}/model.bpk ; diagnostics : {RUN_DIR}/training.log",
+        "Entraînement {}. Poids : {} ; diagnostics : {}",
         if interrupted {
             "interrompu"
         } else {
             "terminé"
         },
+        restart.run_dir.join("model.bpk").display(),
+        restart.run_dir.join("training.log").display(),
     );
 
     Ok(())
@@ -278,8 +286,8 @@ mod tests {
             dataset::load_validation_samples(&root.join(dataset::VALID_ANNOTATIONS_PATH), &images)?;
         let device = default_device();
         for (index, entries) in samples.chunks(4).enumerate() {
-            let batch = make_batch(entries, &images, &device)?;
-            let diagnostics = validation_diagnostics(&model, &batch)?;
+            let batch = make_batch(entries, &images, &device, model.config)?;
+            let diagnostics = validation_diagnostics(&model.network, &batch)?;
             assert!(diagnostics.total.is_finite(), "lot {}", index + 1);
             if index % 100 == 0 || (590..605).contains(&index) {
                 println!("Validation checkpoint · lot {} : {diagnostics}", index + 1);
@@ -344,6 +352,7 @@ mod tests {
             }],
             dir.path(),
             &valid_device,
+            detection_config::DetectionConfig::default(),
         )?;
         let diagnostics = validation_diagnostics(&valid_model, &batch)?;
         assert!(diagnostics.total.is_finite());
