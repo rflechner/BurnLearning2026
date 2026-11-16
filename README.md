@@ -64,6 +64,49 @@ Tests de l'API (pagination, annotations, JPEG, erreurs et confinement des chemin
 cargo test --manifest-path face_lookup/Cargo.toml
 ```
 
+## Entraînement avec le tableau de bord Burn
+
+Depuis la racine du dépôt, dans un terminal interactif :
+
+```sh
+cargo run --release --manifest-path face_lookup/Cargo.toml -- --train
+```
+
+Un terminal d'environ 120 colonnes sur 40 lignes permet de lire toutes les métriques.
+
+Dans RustRover, la configuration Cargo utilise `run --release -- --train`, avec
+le répertoire de travail `face_lookup` et **Emulate terminal in output console**
+activé. Les annotations seules ne suffisent pas : l'archive `WIDER_train.zip` doit
+être extraite pour obtenir
+`face_lookup/data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/WIDER_train/images`.
+Si les photos sont ailleurs, définir `IMAGES_ROOT` sur leur dossier `WIDER_train/images`
+dans les variables d'environnement de la configuration. L'entraînement vérifie les
+fichiers sélectionnés avant d'initialiser le GPU et d'ouvrir l'interface.
+
+Le tableau de bord natif de Burn affiche la progression des époques et les courbes
+de **loss totale**, **présence**, **localisation brute**, **localisation pondérée**
+et **learning rate**. La loss totale vaut `présence + LOCALIZATION_WEIGHT × localisation` ;
+le poids vaut actuellement 1, donc les deux courbes de localisation sont identiques.
+Les valeurs par lot et les moyennes de l'époque sont affichées ; les moyennes des
+losses utilisent le nombre de positifs (borné à 1), comme leur normalisation.
+Les diagnostics des tailles des boîtes, des positifs et des collisions sont
+conservés dans `runs/dilated/training.log`, recréé à chaque lancement.
+
+- `←` / `→` : choisir la métrique à tracer.
+- `↑` / `↓` : changer la vue du graphique.
+- `q`, puis `s` : arrêter après le lot en cours et sauvegarder les poids.
+
+Les poids sont enregistrés dans `runs/dilated/model.bpk` à chaque époque et lors
+d'un arrêt demandé par l'interface. Ces chemins sont relatifs au répertoire de
+lancement, comme pour le serveur de visualisation. Si la sortie est redirigée vers
+un fichier ou un pipe, Burn utilise son affichage texte et les diagnostics restent
+imprimés. Le terminal est restauré à la fin de l'entraînement.
+
+L'entraînement conserve ses paramètres actuels : les 100 premières images ayant
+au plus 20 annotations, lots de 4, 100 époques, Adam et décroissance cosinus du taux
+d'apprentissage. Les métriques affichées concernent uniquement l'entraînement ;
+aucun jeu de validation n'est encore configuré.
+
 ## Visualisation des visages
 
 Ouvrir `http://127.0.0.1:3001/` après le lancement du serveur : la page HTML

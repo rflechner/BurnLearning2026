@@ -29,7 +29,7 @@ pub fn prepare_image(original: &image::RgbImage) -> (Vec<f32>, u32, u32, usize, 
 }
 
 pub struct DetectionBatch {
-    pub images: Tensor<4>,        // [N, 3, 320, 320], RGB en plans séparés
+    pub images: Tensor<4>, // [N, 3, 320, 320], RGB en plans séparés
     /// Gaussienne centrée sur chaque cellule positive (1 au centre). Les voisines voient
     /// presque les mêmes pixels : elles restent négatives, mais pénalisées moins fort.
     pub heatmap: Tensor<4>, // [N, 1, 40, 40]
@@ -37,7 +37,7 @@ pub struct DetectionBatch {
     /// donc comparable entre un visage de 5 px et un de 200 px.
     pub boxes: Tensor<4>, // [N, 4, 40, 40]
     pub positive_mask: Tensor<4>, // [N, 1, 40, 40], 1 à la cellule du centre d'un visage retenu
-    pub valid_mask: Tensor<4>,    // cellules utilisables pour la présence
+    pub valid_mask: Tensor<4>, // cellules utilisables pour la présence
     pub collisions: usize,
 }
 
@@ -68,7 +68,10 @@ pub fn make_batch(
         {
             return Err(format!("Chemin image invalide : {}", relative.display()).into());
         }
-        let original = image::open(images_root.join(relative))?.to_rgb8();
+        let path = images_root.join(relative);
+        let original = image::open(&path)
+            .map_err(|error| format!("Impossible de lire l'image {} : {error}", path.display()))?
+            .to_rgb8();
         let (ow, oh) = original.dimensions();
         if ow == 0 || oh == 0 {
             return Err("Image vide".into());
@@ -223,7 +226,7 @@ mod tests {
         assert_eq!(before.dims(), [1, 5, 40, 40]);
         let loss = crate::loss::detection_loss(before.clone(), &batch);
         assert!(loss.total.clone().into_scalar::<f32>().is_finite());
-        let diagnostics = loss.diagnostics(&batch)?;
+        let diagnostics = loss.diagnostics(&batch)?.to_string();
         assert!(diagnostics.contains("positifs=1"));
         assert!(diagnostics.contains("attendue=64.00×48.00px"));
         let total = loss.total.clone().into_scalar::<f32>();
@@ -247,7 +250,7 @@ mod tests {
             .abs()
             .max()
             .into_scalar::<f32>();
-        assert!(difference < 1e-5);
+        assert!(difference < 1e-5, "Écart après rechargement : {difference}");
         let empty = vec![AnnotatedImage {
             image_file_path: "sample.png".into(),
             faces: vec![],
@@ -264,6 +267,7 @@ mod tests {
         assert!(
             empty_loss
                 .diagnostics(&batch)?
+                .to_string()
                 .contains("tailles=n/a (aucun positif)")
         );
         Ok(())

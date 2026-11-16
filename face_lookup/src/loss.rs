@@ -46,13 +46,37 @@ pub struct DetectionLoss {
     predicted_log_sizes: Tensor<4>,
 }
 
+/// Valeurs détachées du graphe, partagées par le tableau de bord et le journal.
+pub struct DetectionDiagnostics {
+    pub total: f32,
+    pub presence: f32,
+    pub localization: f32,
+    pub positives: usize,
+    pub sizes: String,
+}
+
+impl std::fmt::Display for DetectionDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "perte={:.6}, présence={:.6}, localisation={:.6}, localisation_pondérée={:.6}, positifs={}, {}",
+            self.total,
+            self.presence,
+            self.localization,
+            self.localization * LOCALIZATION_WEIGHT,
+            self.positives,
+            self.sizes,
+        )
+    }
+}
+
 impl DetectionLoss {
     /// Mesures avant la mise à jour, aux seules cellules positives.
     /// Les tailles sont en pixels de l'entrée 320×320, pas de l'image originale.
     pub fn diagnostics(
         &self,
         batch: &DetectionBatch,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<DetectionDiagnostics, Box<dyn std::error::Error>> {
         let total = self.total.clone().into_scalar::<f32>();
         let presence = self.presence.clone().into_scalar::<f32>();
         let localization = self.localization.clone().into_scalar::<f32>();
@@ -98,9 +122,12 @@ impl DetectionLoss {
                 absolute_error[1] / n
             )
         };
-        Ok(format!(
-            "perte={total:.6}, présence={presence:.6}, localisation={localization:.6}, localisation_pondérée={:.6}, positifs={count}, {sizes}",
-            localization * LOCALIZATION_WEIGHT
-        ))
+        Ok(DetectionDiagnostics {
+            total,
+            presence,
+            localization,
+            positives: count,
+            sizes,
+        })
     }
 }

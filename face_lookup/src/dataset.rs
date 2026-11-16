@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Lines};
 use std::iter::Peekable;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// One face annotation line: `x y w h blur expression illumination invalid occlusion pose`.
 /// All original attributes are kept so the filtering policy can change later.
@@ -55,8 +55,82 @@ pub fn images_root() -> PathBuf {
 
 /// Opens an annotation file and returns its lazy block iterator.
 pub fn load_annotations(path: impl AsRef<Path>) -> io::Result<WiderAnnotations<BufReader<File>>> {
-    let file = File::open(path)?;
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Impossible d'ouvrir les annotations {} : {error}",
+                path.display()
+            ),
+        )
+    })?;
     Ok(WiderAnnotations::new(BufReader::new(file)))
+}
+
+/// Vérifie le petit jeu d'entraînement avant l'initialisation du GPU et de l'UI.
+pub fn load_training_samples(
+    annotations_path: &Path,
+    images_root: &Path,
+) -> io::Result<Vec<AnnotatedImage>> {
+    let samples = load_annotations(annotations_path)?
+        // Conserver les erreurs pour que collect() les propage.
+        .filter(|sample| {
+            sample
+                .as_ref()
+                .map(|item| item.faces.len() <= 20)
+                .unwrap_or(true)
+        })
+        .take(100)
+        .collect::<io::Result<Vec<_>>>()?;
+    if samples.is_empty() {
+        return Err(invalid_data("Aucune image d'entraînement".into()));
+    }
+
+    let metadata = std::fs::metadata(images_root).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Dossier des images inaccessible : {}. Extraire WIDER_train.zip dans le dossier du dataset ou définir IMAGES_ROOT vers WIDER_train/images. Détail : {error}",
+                images_root.display(),
+            ),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!(
+                "IMAGES_ROOT doit être un dossier : {}",
+                images_root.display()
+            ),
+        ));
+    }
+    for sample in &samples {
+        let relative = Path::new(&sample.image_file_path);
+        if relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(invalid_data(format!(
+                "Chemin image invalide : {}",
+                relative.display()
+            )));
+        }
+        let path = images_root.join(relative);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Image d'entraînement inaccessible : {}. Vérifier l'extraction de WIDER_train.zip et IMAGES_ROOT. Détail : {error}", path.display()),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(invalid_data(format!(
+                "L'image n'est pas un fichier : {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(samples)
 }
 
 /// Streams `data/train.train` in the WIDER block format.
@@ -203,4 +277,49 @@ fn is_zero_line(line: &str) -> bool {
 
 fn invalid_data(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_preflight_identifies_missing_paths() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let annotations = dir.path().join("annotations.txt");
+        let images = dir.path().join("images");
+        let error = load_training_samples(&annotations, &images).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains(&annotations.display().to_string())
+        );
+        std::fs::write(&annotations, "event/sample.jpg\n1\n1 2 3 4 0 0 0 0 0 0\n")?;
+        let error = load_training_samples(&annotations, &images).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("IMAGES_ROOT"));
+        assert!(error.to_string().contains(&images.display().to_string()));
+        std::fs::create_dir_all(images.join("event"))?;
+        let image = images.join("event/sample.jpg");
+        let error = load_training_samples(&annotations, &images).unwrap_err();
+        assert!(error.to_string().contains(&image.display().to_string()));
+        // La prévalidation vérifie la présence ; le décodage reste fait par lot.
+        std::fs::write(&image, b"fixture")?;
+        let samples = load_training_samples(&annotations, &images)?;
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].image_file_path, "event/sample.jpg");
+        Ok(())
+    }
+
+    #[test]
+    fn training_preflight_propagates_malformed_annotations() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let annotations = dir.path().join("annotations.txt");
+        std::fs::write(&annotations, "event/sample.jpg\n1\ninvalid box\n")?;
+        let error = load_training_samples(&annotations, dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid integer"));
+        Ok(())
+    }
 }

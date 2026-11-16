@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.22.1", features = ["wgpu", "cuda", "metal", "autodiff", "store"] }
+burn = { version = "0.22.1", features = ["wgpu", "cuda", "metal", "autodiff", "store", "train", "tui"] }
 image = "0.25.10"
 
 axum = "0.8"

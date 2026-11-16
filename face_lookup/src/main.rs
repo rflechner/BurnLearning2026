@@ -6,6 +6,7 @@ mod infer;
 mod loss;
 mod model;
 mod render;
+mod training_ui;
 
 use crate::batch::make_batch;
 use crate::loss::detection_loss;
@@ -61,6 +62,7 @@ fn train_dataset(
     annotations_path: &std::path::Path,
     images_root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let samples = dataset::load_training_samples(annotations_path, images_root)?;
     let device = default_device().autodiff();
     println!("Using device: {:?}", device);
     device.seed(42);
@@ -68,48 +70,54 @@ fn train_dataset(
     let mut model = Model::default(&device);
     let mut optimizer = AdamConfig::new().init();
 
-    // Petit ensemble pour commencer.
-    let samples = dataset::load_annotations(annotations_path)?
-        .filter(|sample| {
-            if let Ok(item) = sample {
-                item.faces.len() <= 20
-            } else {
-                false
-            }
-        })
-        .take(100)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if samples.is_empty() {
-        return Err("Aucune image d'entraînement".into());
-    }
     // Nouveau dossier : les poids de runs/first ont l'ancienne architecture et ne se chargent plus.
     std::fs::create_dir_all(RUN_DIR)?;
 
     let batches = samples.len().div_ceil(4);
     let total_steps = EPOCHS * batches;
+    let mut dashboard =
+        training_ui::TrainingDashboard::new(std::path::Path::new(RUN_DIR), EPOCHS, samples.len())?;
     for epoch in 0..EPOCHS {
+        dashboard.start_epoch(epoch, samples.len());
+        let mut updated = false;
         for (batch_index, entries) in samples.chunks(4).enumerate() {
+            if dashboard.should_stop() {
+                break;
+            }
             let batch = make_batch(entries, images_root, &device)?;
 
             let predictions = model.forward(batch.images.clone());
             let loss = detection_loss(predictions, &batch);
             let lr = learning_rate(epoch * batches + batch_index, total_steps);
 
-            println!(
-                "Époque {} · lot {}/{} : {}, collisions={}, lr={lr:.2e}",
-                epoch + 1,
-                batch_index + 1,
-                batches,
-                loss.diagnostics(&batch)?,
-                batch.collisions
-            );
+            let diagnostics = loss.diagnostics(&batch)?;
             let gradients = loss.total.backward();
             let gradients = GradientsParams::from_grads(gradients, &model);
             model = optimizer.step(lr, model, gradients);
+            updated = true;
+            dashboard.update(&diagnostics, entries.len(), batch.collisions, lr)?;
         }
-        model.clone().into_record().save(format!("{RUN_DIR}/model.bpk"))?;
+        dashboard.end_epoch();
+        if updated {
+            model
+                .clone()
+                .into_record()
+                .save(format!("{RUN_DIR}/model.bpk"))?;
+        }
+        if dashboard.should_stop() {
+            break;
+        }
     }
+    let interrupted = dashboard.should_stop();
+    dashboard.finish()?;
+    println!(
+        "Entraînement {}. Poids : {RUN_DIR}/model.bpk ; diagnostics : {RUN_DIR}/training.log",
+        if interrupted {
+            "interrompu"
+        } else {
+            "terminé"
+        },
+    );
 
     Ok(())
 }
