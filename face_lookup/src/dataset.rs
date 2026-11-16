@@ -43,6 +43,7 @@ pub struct WiderAnnotations<R: BufRead> {
 }
 
 pub(crate) const ANNOTATIONS_PATH: &str = "data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_train_bbx_gt.txt";
+pub(crate) const VALID_ANNOTATIONS_PATH: &str = "data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/wider_face_split/wider_face_val_bbx_gt.txt";
 
 /// Annotation paths are relative to `WIDER_train/images/`, next to `wider_face_split/`.
 pub fn images_root() -> PathBuf {
@@ -51,6 +52,14 @@ pub fn images_root() -> PathBuf {
         .and_then(|p| p.parent())
         .map(|extracted| extracted.join("WIDER_train/images"))
         .expect("annotations path has two parent directories")
+}
+
+pub fn validation_images_root() -> PathBuf {
+    Path::new(VALID_ANNOTATIONS_PATH)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|extracted| extracted.join("WIDER_val/images"))
+        .expect("validation annotations path has two parent directories")
 }
 
 /// Opens an annotation file and returns its lazy block iterator.
@@ -68,30 +77,50 @@ pub fn load_annotations(path: impl AsRef<Path>) -> io::Result<WiderAnnotations<B
     Ok(WiderAnnotations::new(BufReader::new(file)))
 }
 
-/// Vérifie le petit jeu d'entraînement avant l'initialisation du GPU et de l'UI.
+/// Vérifie toutes les images d'entraînement avant l'initialisation du GPU et de l'UI.
 pub fn load_training_samples(
     annotations_path: &Path,
     images_root: &Path,
 ) -> io::Result<Vec<AnnotatedImage>> {
-    let samples = load_annotations(annotations_path)?
-        // Conserver les erreurs pour que collect() les propage.
-        .filter(|sample| {
-            sample
-                .as_ref()
-                .map(|item| item.faces.len() <= 20)
-                .unwrap_or(true)
-        })
-        .take(100)
-        .collect::<io::Result<Vec<_>>>()?;
+    load_samples(
+        annotations_path,
+        images_root,
+        "entraînement",
+        "WIDER_train",
+        "IMAGES_ROOT",
+    )
+}
+
+pub fn load_validation_samples(
+    annotations_path: &Path,
+    images_root: &Path,
+) -> io::Result<Vec<AnnotatedImage>> {
+    load_samples(
+        annotations_path,
+        images_root,
+        "validation",
+        "WIDER_val",
+        "VALID_IMAGES_ROOT",
+    )
+}
+
+fn load_samples(
+    annotations_path: &Path,
+    images_root: &Path,
+    split: &str,
+    archive: &str,
+    root_variable: &str,
+) -> io::Result<Vec<AnnotatedImage>> {
+    let samples = load_annotations(annotations_path)?.collect::<io::Result<Vec<_>>>()?;
     if samples.is_empty() {
-        return Err(invalid_data("Aucune image d'entraînement".into()));
+        return Err(invalid_data(format!("Aucune image de {split}")));
     }
 
     let metadata = std::fs::metadata(images_root).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
-                "Dossier des images inaccessible : {}. Extraire WIDER_train.zip dans le dossier du dataset ou définir IMAGES_ROOT vers WIDER_train/images. Détail : {error}",
+                "Dossier des images de {split} inaccessible : {}. Extraire {archive}.zip dans le dossier du dataset ou définir {root_variable} vers {archive}/images. Détail : {error}",
                 images_root.display(),
             ),
         )
@@ -100,7 +129,7 @@ pub fn load_training_samples(
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
             format!(
-                "IMAGES_ROOT doit être un dossier : {}",
+                "{root_variable} doit être un dossier : {}",
                 images_root.display()
             ),
         ));
@@ -120,7 +149,7 @@ pub fn load_training_samples(
         let metadata = std::fs::metadata(&path).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("Image d'entraînement inaccessible : {}. Vérifier l'extraction de WIDER_train.zip et IMAGES_ROOT. Détail : {error}", path.display()),
+                format!("Image de {split} inaccessible : {}. Vérifier l'extraction de {archive}.zip et {root_variable}. Détail : {error}", path.display()),
             )
         })?;
         if !metadata.is_file() {
@@ -320,6 +349,29 @@ mod tests {
         let error = load_training_samples(&annotations, dir.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("invalid integer"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_loads_full_split_and_reports_its_own_paths() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let annotations = dir.path().join("val.txt");
+        let images = dir.path().join("WIDER_val/images");
+        // Plus de 100 images et plus de 20 visages : aucune ancienne limite du prototype.
+        let sample = format!(
+            "event/sample.jpg\n21\n{}",
+            "1 2 3 4 0 0 0 0 0 0\n".repeat(21)
+        );
+        std::fs::write(&annotations, sample.repeat(101))?;
+        let error = load_validation_samples(&annotations, &images).unwrap_err();
+        assert!(error.to_string().contains("WIDER_val.zip"));
+        assert!(error.to_string().contains("VALID_IMAGES_ROOT"));
+        std::fs::create_dir_all(images.join("event"))?;
+        std::fs::write(images.join("event/sample.jpg"), b"fixture")?;
+        let samples = load_validation_samples(&annotations, &images)?;
+        assert_eq!(samples.len(), 101);
+        assert!(samples.iter().all(|sample| sample.faces.len() == 21));
+        assert_eq!(load_training_samples(&annotations, &images)?.len(), 101);
         Ok(())
     }
 }

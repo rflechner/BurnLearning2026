@@ -45,6 +45,8 @@ Variables d'environnement facultatives :
 - `BIND_ADDR` : adresse d'écoute (défaut `127.0.0.1:3001`).
 - `ANNOTATIONS_PATH` : chemin du fichier d'annotations WIDER FACE.
 - `IMAGES_ROOT` : dossier racine contenant les images (sous-dossiers inclus).
+- `VALID_ANNOTATIONS_PATH` : annotations de validation (défaut : `wider_face_val_bbx_gt.txt` du dataset extrait).
+- `VALID_IMAGES_ROOT` : dossier des images de validation (défaut : `WIDER_val/images` du dataset extrait).
 
 Par défaut, les chemins pointent vers le dataset extrait dans `face_lookup/data`,
 indépendamment du répertoire de lancement. Pour un autre dataset, définir les
@@ -76,36 +78,65 @@ Un terminal d'environ 120 colonnes sur 40 lignes permet de lire toutes les métr
 
 Dans RustRover, la configuration Cargo utilise `run --release -- --train`, avec
 le répertoire de travail `face_lookup` et **Emulate terminal in output console**
-activé. Les annotations seules ne suffisent pas : l'archive `WIDER_train.zip` doit
-être extraite pour obtenir
-`face_lookup/data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/WIDER_train/images`.
-Si les photos sont ailleurs, définir `IMAGES_ROOT` sur leur dossier `WIDER_train/images`
-dans les variables d'environnement de la configuration. L'entraînement vérifie les
-fichiers sélectionnés avant d'initialiser le GPU et d'ouvrir l'interface.
+activé. Les archives `WIDER_train.zip` et `WIDER_val.zip` doivent être extraites dans
+`face_lookup/data/extracted/db171f1b7fedf4d3453e81297ff02f9915356d19/`, avec les dossiers
+`WIDER_train/images`, `WIDER_val/images` et `wider_face_split`.
+Si les photos sont ailleurs, définir `IMAGES_ROOT` et `VALID_IMAGES_ROOT` dans les
+variables d'environnement de la configuration. Les deux jeux sont vérifiés avant
+d'initialiser le GPU et d'ouvrir l'interface.
 
 Le tableau de bord natif de Burn affiche la progression des époques et les courbes
 de **loss totale**, **présence**, **localisation brute**, **localisation pondérée**
-et **learning rate**. La loss totale vaut `présence + LOCALIZATION_WEIGHT × localisation` ;
+avec deux séries **Train / Valid** pour chaque loss. Le **learning rate** est suivi
+uniquement pour Train. La loss totale vaut `présence + LOCALIZATION_WEIGHT × localisation` ;
 le poids vaut actuellement 1, donc les deux courbes de localisation sont identiques.
 Les valeurs par lot et les moyennes de l'époque sont affichées ; les moyennes des
 losses utilisent le nombre de positifs (borné à 1), comme leur normalisation.
+Les moyennes Train et Valid sont séparées et remises à zéro à chaque époque.
 Les diagnostics des tailles des boîtes, des positifs et des collisions sont
-conservés dans `runs/dilated/training.log`, recréé à chaque lancement.
+conservés dans `runs/dilated/training.log`, recréé à chaque lancement. Chaque ligne
+indique l'époque, la phase Train ou Valid et le lot.
 
 - `←` / `→` : choisir la métrique à tracer.
 - `↑` / `↓` : changer la vue du graphique.
 - `q`, puis `s` : arrêter après le lot en cours et sauvegarder les poids.
 
-Les poids sont enregistrés dans `runs/dilated/model.bpk` à chaque époque et lors
-d'un arrêt demandé par l'interface. Ces chemins sont relatifs au répertoire de
-lancement, comme pour le serveur de visualisation. Si la sortie est redirigée vers
+Les poids sont enregistrés dans `runs/dilated/model.bpk` après la phase Train de
+chaque époque, avant la validation, et lors d'un arrêt pendant Train. Un arrêt
+pendant Valid conserve donc les derniers poids entraînés. Chaque sauvegarde est
+écrite dans `model.next.bpk`, puis remplace le checkpoint précédent une fois terminée.
+Ces chemins sont relatifs
+au répertoire de lancement, comme pour le serveur de visualisation. Si la sortie est redirigée vers
 un fichier ou un pipe, Burn utilise son affichage texte et les diagnostics restent
 imprimés. Le terminal est restauré à la fin de l'entraînement.
 
-L'entraînement conserve ses paramètres actuels : les 100 premières images ayant
-au plus 20 annotations, lots de 4, 100 époques, Adam et décroissance cosinus du taux
-d'apprentissage. Les métriques affichées concernent uniquement l'entraînement ;
-aucun jeu de validation n'est encore configuré.
+En cas de panique Rust, `runs/dilated/failure.log` conserve le message, la backtrace,
+l'époque, la phase, le lot et les chemins des images en cours. Les erreurs ordinaires
+sont aussi enregistrées. Le rapport est complété à chaque erreur, sans écraser les
+précédentes. Un message indique son chemin après la fermeture de l'UI.
+Le logger natif de Burn écrit aussi les messages internes (GPU, renderer, etc.)
+dans `runs/dilated/runtime.log`.
+
+Pour repartir de poids sauvegardés après six époques, depuis `face_lookup` :
+
+```sh
+cargo run --release -- --train --resume-weights runs/dilated/model.bpk --start-epoch 7
+```
+
+Les poids sont chargés avant d'ouvrir l'UI et de recréer `training.log`.
+La numérotation des époques et le taux d'apprentissage reprennent au point indiqué.
+**L'état d'Adam n'était pas sauvegardé : ses moments sont réinitialisés.** Il s'agit
+donc d'une reprise des poids, pas d'une continuation strictement identique du calcul.
+Sans ces options, `--train` démarre toujours un nouveau modèle à l'époque 1.
+
+Chaque époque entraîne le modèle sur les **12 880 images de train**, puis évalue
+les **3 226 images de val**, par lots de 4, sans filtrage par nombre de visages.
+La validation emploie `model.valid()` sur un appareil sans autodiff, sans calcul
+de gradients, sans pas d'optimiseur et sans avancer le taux d'apprentissage.
+Le modèle d'entraînement conserve ses poids et son mode d'entraînement.
+Les réglages restent 100 époques, Adam et décroissance cosinus du taux d'apprentissage.
+Le jeu `test` officiel n'est pas utilisé. Les losses de validation servent au suivi ;
+elles ne remplacent pas les métriques officielles de détection WIDER FACE.
 
 ## Visualisation des visages
 
