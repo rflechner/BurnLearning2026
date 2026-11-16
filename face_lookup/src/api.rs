@@ -2,10 +2,11 @@ use std::{io, path::Path as FsPath, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State, rejection::QueryRejection},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,10 @@ pub fn router(state: DatasetState) -> Router {
         .route("/api/train", get(list_images))
         .route("/api/weights", get(list_weights))
         .route("/api/train/{id}/predicted", get(get_predicted_image))
+        .route(
+            "/api/predict",
+            post(predict_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .route("/api/train/{id}/annotated", get(get_annotated_image))
         .route("/api/train/{id}/image", get(get_image))
         .with_state(Arc::new(state))
@@ -308,6 +313,61 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn upload_prediction_validates_requests() {
+        let (_dir, app) = fixture();
+        let post = |uri: &str, body: Vec<u8>| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            request(app.clone(), "/api/predict?weights=x.bpk")
+                .await
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        for (uri, body, expected) in [
+            (
+                "/api/predict?weights=x.bpk",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/api/predict", vec![1], StatusCode::BAD_REQUEST),
+            (
+                "/api/predict?weights=x.bpk&threshold=2",
+                vec![1],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/predict?weights=../x.bpk",
+                vec![1],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/predict?weights=x.txt",
+                vec![1],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/predict?weights=absent/model.bpk",
+                vec![1],
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(post(uri, body).await.unwrap().status(), expected, "{uri}");
+        }
+        // Au-delà de la limite, axum refuse le corps avant d'appeler le handler.
+        let response = post("/api/predict?weights=x.bpk", vec![0; MAX_UPLOAD_BYTES + 1])
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
 
 fn weights_root() -> PathBuf {
@@ -386,13 +446,102 @@ async fn get_predicted_image(
 ) -> Result<Response, ApiError> {
     let Query(query) =
         query.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Paramètres invalides"))?;
-    if !query.threshold.is_finite() || !(0.0..=1.0).contains(&query.threshold) {
+    let path = resolve_weights(&query.weights, query.threshold).await?;
+    let bytes = read_image(&state, id).await?;
+    let png = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let detections = with_model(&state, path, |model| {
+            crate::infer::predict(model, &bytes, query.threshold)
+        })?;
+        let faces = if query.annotations {
+            state.entries[id].faces.as_slice()
+        } else {
+            &[]
+        };
+        crate::infer::overlay(&bytes, faces, &detections)
+    })
+    .await
+    .map_err(task_error)?
+    .map_err(inference_error)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        png,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    weights: String,
+    #[serde(default = "default_threshold")]
+    threshold: f32,
+}
+
+/// Taille maximale d'une photo envoyée : axum limite les corps à 2 Mo par défaut,
+/// ce que dépassent la plupart des photos de téléphone.
+const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Prédit sur une photo envoyée telle quelle dans le corps de la requête.
+/// Répond un PNG avec les prédictions en rouge ; l'en-tête `x-detection-scores`
+/// liste les scores retenus, du plus élevé au plus faible.
+async fn predict_upload(
+    State(state): State<Arc<DatasetState>>,
+    query: Result<Query<UploadQuery>, QueryRejection>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Paramètres invalides"))?;
+    if body.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Aucune image reçue"));
+    }
+    let path = resolve_weights(&query.weights, query.threshold).await?;
+    let (png, detections) = tokio::task::spawn_blocking(move || {
+        let image = crate::infer::load_upload(&body).map_err(|e| {
+            eprintln!("Photo envoyée : {e}");
+            ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Image illisible : envoyez une photo JPEG, PNG ou WebP",
+            )
+        })?;
+        let detections = with_model(&state, path, |model| {
+            crate::infer::predict_image(model, &image, query.threshold)
+        })
+        .map_err(inference_error)?;
+        let png = crate::infer::overlay_image(image, &[], &detections).map_err(inference_error)?;
+        Ok::<_, ApiError>((png, detections))
+    })
+    .await
+    .map_err(task_error)??;
+    let scores = detections
+        .iter()
+        .map(|d| format!("{:.3}", d.score))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        [(
+            header::HeaderName::from_static("x-detection-scores"),
+            scores,
+        )],
+        png,
+    )
+        .into_response())
+}
+
+/// Valide le seuil et résout un fichier `.bpk` sous le dossier des poids, sans pouvoir en sortir.
+async fn resolve_weights(weights: &str, threshold: f32) -> Result<PathBuf, ApiError> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "Seuil attendu entre 0 et 1",
         ));
     }
-    let relative = FsPath::new(&query.weights);
+    let relative = FsPath::new(weights);
     if relative
         .components()
         .any(|c| !matches!(c, std::path::Component::Normal(_)))
@@ -415,53 +564,45 @@ async fn get_predicted_image(
             "Fichier de poids invalide",
         ));
     }
-    let bytes = read_image(&state, id).await?;
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .map_err(|e| e.to_string())?;
-        // Sérialiser l'accès GPU et réutiliser le modèle tant que le fichier est inchangé.
-        let mut cache = state
-            .inference
-            .lock()
-            .map_err(|_| "Modèle indisponible : redémarrez le serveur".to_string())?;
-        if cache
-            .as_ref()
-            .is_none_or(|(p, m, _)| p != &path || *m != modified)
-        {
-            let model = crate::infer::load(&path)?;
-            *cache = Some((path, modified, model));
-        }
-        let detections =
-            crate::infer::predict(&cache.as_ref().unwrap().2, &bytes, query.threshold)?;
-        let faces = if query.annotations {
-            state.entries[id].faces.as_slice()
-        } else {
-            &[]
-        };
-        crate::infer::overlay(&bytes, faces, &detections)
-    })
-    .await
-    .map_err(|e| {
-        eprintln!("Inférence : {e}");
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Échec de l'inférence ; consultez le terminal",
-        )
-    })?;
-    let png = result.map_err(|e| {
-        eprintln!("Inférence : {e}");
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Poids incompatibles ou inférence impossible ; consultez le terminal",
-        )
-    })?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        png,
+    Ok(path)
+}
+
+/// Exécute `run` avec le modèle de `path`, rechargé seulement si le fichier a changé.
+/// Le verrou sérialise l'accès au GPU. Bloquant : à appeler depuis `spawn_blocking`.
+fn with_model<T>(
+    state: &DatasetState,
+    path: PathBuf,
+    run: impl FnOnce(&crate::model::Model) -> Result<T, String>,
+) -> Result<T, String> {
+    let modified = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map_err(|e| e.to_string())?;
+    let mut cache = state
+        .inference
+        .lock()
+        .map_err(|_| "Modèle indisponible : redémarrez le serveur".to_string())?;
+    if cache
+        .as_ref()
+        .is_none_or(|(p, m, _)| p != &path || *m != modified)
+    {
+        let model = crate::infer::load(&path)?;
+        *cache = Some((path, modified, model));
+    }
+    run(&cache.as_ref().unwrap().2)
+}
+
+fn task_error(error: tokio::task::JoinError) -> ApiError {
+    eprintln!("Inférence : {error}");
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Échec de l'inférence ; consultez le terminal",
     )
-        .into_response())
+}
+
+fn inference_error(error: String) -> ApiError {
+    eprintln!("Inférence : {error}");
+    ApiError(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Poids incompatibles ou inférence impossible ; consultez le terminal",
+    )
 }
