@@ -1,6 +1,6 @@
 mod mnist;
 
-use crate::mnist::{MnistDownloadResult, download_mnist_data};
+use crate::mnist::{download_mnist_data, inspect_mnist_files, MnistDownloadResult};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match download_mnist_data()? {
@@ -9,7 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         MnistDownloadResult::Skip => println!("[Skip] - Données MNIST déjà téléchargées."),
     }
-    
+
+    inspect_mnist_files()?;
+
     Ok(())
 }
 
