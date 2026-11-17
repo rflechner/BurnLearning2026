@@ -1,0 +1,9 @@
+[package]
+name = "handwritten-gen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "0.22.1", features = ["wgpu", "cuda", "metal", "autodiff", "store"] }
+image = "0.25.10"
+reqwest = { version = "0.13", features = ["blocking"] }

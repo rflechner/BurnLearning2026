@@ -17,3 +17,6 @@ face_lookup/data/
 runs/
 
 .claude/
+
+
+handwritten-gen/mnist/
