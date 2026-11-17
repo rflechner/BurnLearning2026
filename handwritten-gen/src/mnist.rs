@@ -21,32 +21,10 @@ pub fn download_mnist_data() -> Result<MnistDownloadResult, Box<dyn std::error::
     }
 
     DirBuilder::new().recursive(true).create(mnist_dir)?;
-
-    // let client = reqwest::blocking::Client::new();
-    //
-    // let mut test_response = client
-    //     .get("https://huggingface.co/datasets/ylecun/mnist/resolve/main/mnist/test-00000-of-00001.parquet?download=true")
-    //     .send()?
-    //     .error_for_status()?;
-    //
-    // let test_binary_content = &test_response.bytes()?;
-    //
-    // let mut test_file = File::create(parquet_test_full_path)?;
-    // test_file.write_all(test_binary_content)?;
-
+    
     download_mnist_file(parquet_test_full_path.as_path(), "https://huggingface.co/datasets/ylecun/mnist/resolve/main/mnist/test-00000-of-00001.parquet?download=true")?;
 
     download_mnist_file(parquet_train_full_path.as_path(), "https://huggingface.co/datasets/ylecun/mnist/resolve/main/mnist/train-00000-of-00001.parquet?download=true")?;
-
-    // let mut train_response = client
-    //     .get("https://huggingface.co/datasets/ylecun/mnist/resolve/main/mnist/train-00000-of-00001.parquet?download=true")
-    //     .send()?
-    //     .error_for_status()?;
-    //
-    // let train_binary_content = &train_response.bytes()?;
-    //
-    // let mut train_file = File::create(parquet_train_full_path)?;
-    // train_file.write_all(train_binary_content)?;
 
     Ok(MnistDownloadResult::Success)
 }
